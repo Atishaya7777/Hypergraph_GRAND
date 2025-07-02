@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/148303898674165316/49eb9167f0604e47826870a107ef91e5/artifacts
+end_time: 1751466822799
+entry_point_name: ''
+experiment_id: '148303898674165316'
+lifecycle_stage: active
+run_id: 49eb9167f0604e47826870a107ef91e5
+run_name: kmeans_enhanced_128
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1751466098296
+status: 3
+tags: []
+user_id: atishayamaharjan

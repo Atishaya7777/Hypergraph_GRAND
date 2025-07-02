@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/148303898674165316/099ea4ec9471458bba4870a089000f4d/artifacts
+end_time: 1751469205460
+entry_point_name: ''
+experiment_id: '148303898674165316'
+lifecycle_stage: active
+run_id: 099ea4ec9471458bba4870a089000f4d
+run_name: spectral_enhanced_128
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1751469022284
+status: 3
+tags: []
+user_id: atishayamaharjan

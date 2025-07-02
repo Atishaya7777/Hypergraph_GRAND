@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/148303898674165316/fb2d28be6e1c462bb029e80d7338d402/artifacts
+end_time: 1751471553192
+entry_point_name: ''
+experiment_id: '148303898674165316'
+lifecycle_stage: active
+run_id: fb2d28be6e1c462bb029e80d7338d402
+run_name: merged_datasets_distance_learning
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1751471553168
+status: 3
+tags: []
+user_id: atishayamaharjan

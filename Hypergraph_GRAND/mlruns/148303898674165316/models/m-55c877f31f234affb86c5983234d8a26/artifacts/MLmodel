@@ -1,0 +1,23 @@
+artifact_path: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/148303898674165316/models/m-55c877f31f234affb86c5983234d8a26/artifacts
+flavors:
+  python_function:
+    config:
+      device: null
+    data: data
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.pytorch
+    pickle_module_name: mlflow.pytorch.pickle_module
+    python_version: 3.13.5
+  pytorch:
+    code: null
+    model_data: data
+    pytorch_version: 2.7.1
+mlflow_version: 3.1.1
+model_id: m-55c877f31f234affb86c5983234d8a26
+model_size_bytes: 154555
+model_uuid: m-55c877f31f234affb86c5983234d8a26
+prompts: null
+run_id: 49eb9167f0604e47826870a107ef91e5
+utc_time_created: '2025-07-02 14:33:38.546271'

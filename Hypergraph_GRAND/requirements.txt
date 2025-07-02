@@ -4,3 +4,9 @@ torch_geometric
 scikit-learn
 matplotlib
 networkx
+tqdm
+mlflow
+scipy
+pandas
+numpy
+scikit-learn
