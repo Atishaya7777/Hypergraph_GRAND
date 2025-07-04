@@ -5,10 +5,13 @@ import numpy as np
 import os
 from datetime import datetime
 from tqdm import tqdm
-from load_dataset import load_and_split_datasets, create_membership_function
-from model import HypergraphGRAND, HypergraphClusterAnalyzer
+from model import HypergraphGRAND, clustering_loss_function, clustering_error_function
 import mlflow
 import mlflow.pytorch
+from sklearn.metrics import confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 
 try:
     from deploy import HypergraphGRANDDeployment
@@ -26,211 +29,461 @@ def setup_mlflow():
     """
     Setup MLflow tracking configuration
     """
-    mlflow.set_experiment("HypergraphGRAND_Distance_Learning")
-    print(f"MLflow experiment: HypergraphGRAND_Distance_Learning")
+    mlflow.set_experiment("HypergraphGRAND_Clustering")
+    print(f"MLflow experiment: HypergraphGRAND_Clustering")
     print(f"MLflow tracking URI: {mlflow.get_tracking_uri()}")
 
     try:
-        experiment = mlflow.get_experiment_by_name(
-            "HypergraphGRAND_Distance_Learning")
+        experiment = mlflow.get_experiment_by_name("HypergraphGRAND_Clustering")
         print(f"✓ MLflow experiment found with ID: {experiment.experiment_id}")
     except Exception as e:
         print(f"⚠️ MLflow setup issue: {e}")
 
 
-def compute_distance_loss(output, target, loss_type='mse'):
+def load_hypergraph_dataset(dataset_path):
     """
-    Compute regression loss for distance prediction
+    Load hypergraph dataset from the standard format
+    
+    Args:
+        dataset_path: Path to dataset directory (e.g., './datasets/contact-primary-school/')
+    
+    Returns:
+        dict with hypergraph data and metadata
     """
-    if loss_type == 'mse':
-        return F.mse_loss(output, target)
-    elif loss_type == 'mae':
-        return F.l1_loss(output, target)
-    elif loss_type == 'huber':
-        return F.huber_loss(output, target, delta=1.0)
+    dataset_name = os.path.basename(dataset_path.rstrip('/'))
+    
+    # File paths
+    node_labels_file = os.path.join(dataset_path, f'node-labels-{dataset_name}.txt')
+    hyperedges_file = os.path.join(dataset_path, f'hyperedges-{dataset_name}.txt')
+    label_names_file = os.path.join(dataset_path, f'label-names-{dataset_name}.txt')
+    
+    print(f"Loading dataset: {dataset_name}")
+    print(f"  Node labels: {node_labels_file}")
+    print(f"  Hyperedges: {hyperedges_file}")
+    print(f"  Label names: {label_names_file}")
+    
+    # Load node labels (cluster assignments)
+    node_labels = []
+    with open(node_labels_file, 'r') as f:
+        for line in f:
+            if line.strip():
+                node_labels.append(int(line.strip()))
+    
+    # Load label names (cluster names)
+    label_names = []
+    with open(label_names_file, 'r') as f:
+        for line in f:
+            if line.strip():
+                label_names.append(line.strip())
+    
+    # Load hyperedges
+    hyperedges = []
+    with open(hyperedges_file, 'r') as f:
+        for line in f:
+            if line.strip():
+                # Parse comma-separated node indices and convert from 1-indexed to 0-indexed
+                nodes = [int(x.strip()) - 1 for x in line.strip().split(',')]
+                hyperedges.append(nodes)
+    
+    num_nodes = len(node_labels)
+    num_hyperedges = len(hyperedges)
+    unique_labels = sorted(list(set(node_labels)))
+    
+    print(f"  Nodes: {num_nodes}")
+    print(f"  Hyperedges: {num_hyperedges}")
+    print(f"  Clusters: {len(unique_labels)} ({unique_labels})")
+    
+    # Handle case where there are more clusters than label names
+    available_names = [label_names[i] if i < len(label_names) else f"Cluster_{i+1}" for i in unique_labels]
+    print(f"  Cluster names: {available_names}")
+    
+    # Convert to PyTorch format
+    node_labels_tensor = torch.tensor(node_labels, dtype=torch.long)
+    
+    # Create hyperedge index in PyTorch Geometric format [2, num_edge_connections]
+    edge_list = []
+    for edge_idx, nodes in enumerate(hyperedges):
+        for node in nodes:
+            edge_list.append([edge_idx, node])
+    
+    if edge_list:
+        hyperedge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
     else:
-        raise ValueError(f"Unknown loss type: {loss_type}")
+        hyperedge_index = torch.zeros((2, 0), dtype=torch.long)
+    
+    # Create simple node features (one-hot encoding of node labels + random features)
+    feature_dim = 128
+    node_features = torch.randn(num_nodes, feature_dim)
+    
+    # Add one-hot cluster information to features
+    num_clusters = len(unique_labels)
+    cluster_onehot = torch.zeros(num_nodes, num_clusters)
+    for i, label in enumerate(node_labels):
+        cluster_idx = unique_labels.index(label)
+        cluster_onehot[i, cluster_idx] = 1.0
+    
+    # Concatenate random features with cluster one-hot
+    node_features = torch.cat([node_features, cluster_onehot], dim=1)
+    
+    # Create membership matrix (binary membership for hyperedges)
+    membership = torch.zeros(num_hyperedges, num_nodes)
+    for edge_idx, nodes in enumerate(hyperedges):
+        for node in nodes:
+            membership[edge_idx, node] = 1.0
+    
+    return {
+        'x': node_features,
+        'hyperedge_index': hyperedge_index,
+        'membership': membership,
+        'node_labels': node_labels_tensor,
+        'label_names': label_names,
+        'num_nodes': num_nodes,
+        'num_hyperedges': num_hyperedges,
+        'num_clusters': len(unique_labels),
+        'cluster_names': [label_names[i] if i < len(label_names) else f"Cluster_{i+1}" for i in unique_labels],
+        'dataset_name': dataset_name
+    }
 
 
-def train_model(model, data_dict, epochs=100, lr=0.01, loss_type='mse'):
+def log_dataset_info(train_data, test_data, train_labels, test_labels):
     """
-    Training loop for the HypergraphGRAND model with distance regression
+    Create and log dataset visualization and statistics
     """
-    x = data_dict['x']
-    hyperedge_index = data_dict['hyperedge_index']
-    membership = data_dict['membership']
-    target_distances = data_dict['target_distances']
-    train_mask = data_dict['train_mask']
-    val_mask = data_dict['val_mask']
+    # Create dataset comparison plot
+    plt.figure(figsize=(15, 10))
+    
+    # Dataset statistics
+    plt.subplot(2, 3, 1)
+    datasets = ['Primary School\n(Training)', 'High School\n(Testing)']
+    nodes = [train_data['num_nodes'], test_data['num_nodes']]
+    colors = ['skyblue', 'lightcoral']
+    bars = plt.bar(datasets, nodes, color=colors)
+    plt.title('Number of Nodes', fontweight='bold')
+    plt.ylabel('Count')
+    for bar, count in zip(bars, nodes):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5, 
+                str(count), ha='center', fontweight='bold')
+    
+    plt.subplot(2, 3, 2)
+    hyperedges = [train_data['num_hyperedges'], test_data['num_hyperedges']]
+    bars = plt.bar(datasets, hyperedges, color=colors)
+    plt.title('Number of Hyperedges', fontweight='bold')
+    plt.ylabel('Count')
+    for bar, count in zip(bars, hyperedges):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 100, 
+                str(count), ha='center', fontweight='bold')
+    
+    plt.subplot(2, 3, 3)
+    clusters = [train_data['num_clusters'], test_data['num_clusters']]
+    bars = plt.bar(datasets, clusters, color=colors)
+    plt.title('Number of Clusters', fontweight='bold')
+    plt.ylabel('Count')
+    for bar, count in zip(bars, clusters):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1, 
+                str(count), ha='center', fontweight='bold')
+    
+    # Cluster distribution for training data
+    plt.subplot(2, 3, 4)
+    train_unique, train_counts = torch.unique(train_labels, return_counts=True)
+    plt.bar(range(len(train_unique)), train_counts.numpy(), color='skyblue', alpha=0.7)
+    plt.title('Training Set Cluster Distribution', fontweight='bold')
+    plt.xlabel('Cluster ID')
+    plt.ylabel('Number of Nodes')
+    plt.xticks(range(len(train_unique)), train_unique.numpy())
+    
+    # Cluster distribution for testing data
+    plt.subplot(2, 3, 5)
+    test_unique, test_counts = torch.unique(test_labels, return_counts=True)
+    plt.bar(range(len(test_unique)), test_counts.numpy(), color='lightcoral', alpha=0.7)
+    plt.title('Testing Set Cluster Distribution', fontweight='bold')
+    plt.xlabel('Cluster ID')
+    plt.ylabel('Number of Nodes')
+    plt.xticks(range(len(test_unique)), test_unique.numpy())
+    
+    # Feature dimensions comparison
+    plt.subplot(2, 3, 6)
+    feature_dims = [train_data['x'].size(1), test_data['x'].size(1)]
+    bars = plt.bar(datasets, feature_dims, color=colors)
+    plt.title('Feature Dimensions', fontweight='bold')
+    plt.ylabel('Dimension')
+    for bar, dim in zip(bars, feature_dims):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, 
+                str(dim), ha='center', fontweight='bold')
+    
+    plt.tight_layout()
+    dataset_plot_name = 'dataset_comparison.png'
+    plt.savefig(dataset_plot_name, dpi=150, bbox_inches='tight')
+    mlflow.log_artifact(dataset_plot_name, 'dataset_info')
+    plt.close()
+    
+    # Remove temporary file
+    if os.path.exists(dataset_plot_name):
+        os.remove(dataset_plot_name)
+    
+    # Log cluster names and mappings
+    mlflow.log_dict(train_data['cluster_names'], 'train_cluster_names.json')
+    mlflow.log_dict(test_data['cluster_names'], 'test_cluster_names.json')
+    
+    print("Dataset information logged to MLflow")
 
+
+def train_clustering_model(model, train_data, train_labels, epochs=100, lr=0.01):
+    """
+    Training loop for clustering-based HypergraphGRAND model
+    """
+    x = train_data['x']
+    hyperedge_index = train_data['hyperedge_index']
+    membership = train_data['membership']
+    
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
     model.train()
 
-    print(f"Starting training for {epochs} epochs with learning rate {lr}")
+    print(f"Starting clustering training for {epochs} epochs with learning rate {lr}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-    print(f"Loss type: {loss_type}")
-    print(f"Training on {train_mask.sum().item()} nodes, validating on {
-          val_mask.sum().item()} nodes")
+    print(f"Training on {len(train_labels)} nodes")
+    print(f"Number of clusters: {len(torch.unique(train_labels))}")
 
+    # Progress bar for training
     pbar = tqdm(range(epochs), desc="Training", ncols=100)
     loss_history = []
-    val_loss_history = []
-    best_val_loss = float('inf')
+    accuracy_history = []
 
     for epoch in pbar:
         model.train()
         optimizer.zero_grad()
 
-        out = model(x, hyperedge_index, membership=membership)
-
-        # Use only training nodes for loss computation
-        train_loss = compute_distance_loss(
-            out[train_mask], target_distances[train_mask], loss_type)
-        loss_val = train_loss.item()
+        # Forward pass - get latent representations
+        latent_representations = model(x, hyperedge_index, membership=membership)
+        
+        # Compute clustering loss
+        loss = clustering_loss_function(latent_representations, train_labels)
+        loss_val = loss.item()
         loss_history.append(loss_val)
 
+        # Log metrics to MLflow
         try:
             mlflow.log_metric("train_loss", loss_val, step=epoch)
-            mlflow.log_metric("epoch", epoch)
             if epoch % 20 == 0:
-                print(f"✓ MLflow logged train_loss: {
-                      loss_val:.4f} at step {epoch}")
+                print(f"✓ MLflow logged train_loss: {loss_val:.4f} at step {epoch}")
         except Exception as e:
             print(f"⚠️ MLflow train logging failed: {e}")
 
-        train_loss.backward()
+        loss.backward()
         optimizer.step()
 
-        model.eval()
-        with torch.no_grad():
-            val_out = model(x, hyperedge_index, membership=membership)
-            val_loss = compute_distance_loss(
-                val_out[val_mask], target_distances[val_mask], loss_type)
-            val_loss_val = val_loss.item()
-            val_loss_history.append(val_loss_val)
-
-            try:
-                mlflow.log_metric("val_loss", val_loss_val, step=epoch)
-                if epoch % 20 == 0:
-                    print(f"✓ MLflow logged val_loss: {
-                          val_loss_val:.4f} at step {epoch}")
-            except Exception as e:
-                print(f"⚠️ MLflow val logging failed: {e}")
-
-            if val_loss_val < best_val_loss:
-                best_val_loss = val_loss_val
+        # Evaluate clustering accuracy periodically
+        if epoch % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                eval_representations = model(x, hyperedge_index, membership=membership)
+                _, accuracy = clustering_error_function(eval_representations, train_labels)
+                accuracy_history.append(accuracy)
+                
                 try:
-                    mlflow.log_metric(
-                        "best_val_loss", best_val_loss, step=epoch)
+                    mlflow.log_metric("train_accuracy", accuracy, step=epoch)
                     if epoch % 20 == 0:
-                        print(f"✓ New best val loss: {
-                              best_val_loss:.4f} logged to MLflow")
+                        print(f"✓ MLflow logged train_accuracy: {accuracy:.4f} at step {epoch}")
                 except Exception as e:
-                    print(f"⚠️ MLflow best val logging failed: {e}")
+                    print(f"⚠️ MLflow accuracy logging failed: {e}")
 
         pbar.set_postfix({
-            'Train Loss': f'{loss_val:.4f}',
-            'Val Loss': f'{val_loss_val:.4f}',
+            'Loss': f'{loss_val:.4f}',
+            'Accuracy': f'{accuracy_history[-1]:.4f}' if accuracy_history else 'N/A',
             'Epoch': f'{epoch+1}/{epochs}'
         })
 
+        # Log progress every 20 epochs
         if epoch % 20 == 0:
-            log_msg = f'Epoch {
-                epoch:03d}/{epochs}, Train Loss: {loss_val:.4f}, Val Loss: {val_loss_val:.4f}'
+            acc_str = f', Accuracy: {accuracy_history[-1]:.4f}' if accuracy_history else ''
+            log_msg = f'Epoch {epoch:03d}/{epochs}, Loss: {loss_val:.4f}{acc_str}'
             tqdm.write(log_msg)
 
     pbar.close()
 
+    # Log final training metrics
     mlflow.log_metric("final_train_loss", loss_history[-1])
-    mlflow.log_metric("final_val_loss", val_loss_history[-1])
-    mlflow.log_metric("best_train_loss", min(loss_history))
-    mlflow.log_metric("best_val_loss", min(val_loss_history))
-    mlflow.log_metric("avg_train_loss", sum(loss_history)/len(loss_history))
-    mlflow.log_metric("avg_val_loss", sum(
-        val_loss_history)/len(val_loss_history))
+    if accuracy_history:
+        mlflow.log_metric("final_train_accuracy", accuracy_history[-1])
+        mlflow.log_metric("best_train_accuracy", max(accuracy_history))
+    
+    # Create and log loss curve plot
+    plt.figure(figsize=(12, 5))
+    
+    # Loss curve
+    plt.subplot(1, 2, 1)
+    plt.plot(loss_history, 'b-', linewidth=2, label='Training Loss')
+    plt.title('Training Loss Curve', fontsize=14, fontweight='bold')
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    # Accuracy curve (only every 10 epochs)
+    if accuracy_history:
+        plt.subplot(1, 2, 2)
+        epochs_with_acc = list(range(0, len(loss_history), 10))[:len(accuracy_history)]
+        plt.plot(epochs_with_acc, accuracy_history, 'g-', linewidth=2, marker='o', markersize=4, label='Training Accuracy')
+        plt.title('Training Accuracy Curve', fontsize=14, fontweight='bold')
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_curves.png', dpi=150, bbox_inches='tight')
+    mlflow.log_artifact('training_curves.png', 'plots')
+    plt.close()
+    
+    # Remove temporary file
+    if os.path.exists('training_curves.png'):
+        os.remove('training_curves.png')
 
     print(f"Training completed!")
     print(f"Final train loss: {loss_history[-1]:.4f}")
-    print(f"Final val loss: {val_loss_history[-1]:.4f}")
-    print(f"Best train loss: {min(loss_history):.4f} at epoch {
-          loss_history.index(min(loss_history))}")
-    print(f"Best val loss: {min(val_loss_history):.4f} at epoch {
-          val_loss_history.index(min(val_loss_history))}")
+    if accuracy_history:
+        print(f"Final train accuracy: {accuracy_history[-1]:.4f}")
+        print(f"Best train accuracy: {max(accuracy_history):.4f}")
 
-    return model, loss_history, val_loss_history
-
-
-def evaluate_model(model, data_dict, split='test'):
+    return model, loss_history, accuracy_history
+def evaluate_clustering_model(model, test_data, test_labels, split_name='test'):
     """
-    Evaluate model performance on distance prediction for specified split
+    Evaluate clustering model performance on test data
     """
-    x = data_dict['x']
-    hyperedge_index = data_dict['hyperedge_index']
-    membership = data_dict['membership']
-    target_distances = data_dict['target_distances']
-
-    if split == 'train':
-        mask = data_dict['train_mask']
-    elif split == 'val':
-        mask = data_dict['val_mask']
-    elif split == 'test':
-        mask = data_dict['test_mask']
-    else:
-        raise ValueError(f"Unknown split: {split}")
-
+    x = test_data['x']
+    hyperedge_index = test_data['hyperedge_index']
+    membership = test_data['membership']
+    
     model.eval()
     with torch.no_grad():
-        pred_distances = model(x, hyperedge_index, membership=membership)
-
-        pred_split = pred_distances[mask]
-        target_split = target_distances[mask]
-
-        mse_loss = F.mse_loss(pred_split, target_split)
-        mae_loss = F.l1_loss(pred_split, target_split)
-
-        pred_np = pred_split.numpy().flatten()
-        target_np = target_split.numpy().flatten()
-        correlation = np.corrcoef(pred_np, target_np)[0, 1]
-
-        relative_error = torch.abs(
-            pred_split - target_split) / (target_split + 1e-8)
-        mean_relative_error = relative_error.mean()
-
-        mlflow.log_metric(f"eval_{split}_mse", mse_loss.item())
-        mlflow.log_metric(f"eval_{split}_mae", mae_loss.item())
-        mlflow.log_metric(f"eval_{split}_correlation", correlation)
-        mlflow.log_metric(
-            f"eval_{split}_mean_relative_error", mean_relative_error.item())
-
-        print(f"Evaluation Results ({split} set, {mask.sum().item()} nodes):")
-        print(f"  MSE Loss: {mse_loss.item():.4f}")
-        print(f"  MAE Loss: {mae_loss.item():.4f}")
-        print(f"  Correlation: {correlation:.4f}")
-        print(f"  Mean Relative Error: {mean_relative_error.item():.4f}")
-
-        print(f"  Target distance range: [{
-              target_split.min():.3f}, {target_split.max():.3f}]")
-        print(f"  Predicted distance range: [{
-              pred_split.min():.3f}, {pred_split.max():.3f}]")
-
+        # Get latent representations
+        latent_representations = model(x, hyperedge_index, membership=membership)
+        
+        # Compute clustering loss
+        test_loss = clustering_loss_function(latent_representations, test_labels)
+        
+        # Compute clustering accuracy and confusion matrix
+        confusion_mat, accuracy = clustering_error_function(latent_representations, test_labels)
+        
+        # Log evaluation metrics to MLflow
+        mlflow.log_metric(f"eval_{split_name}_loss", test_loss.item())
+        mlflow.log_metric(f"eval_{split_name}_accuracy", accuracy)
+        
+        # Create and log confusion matrix plot
+        plt.figure(figsize=(10, 8))
+        plt.imshow(confusion_mat, interpolation='nearest', cmap=plt.cm.Blues)
+        plt.title(f'Confusion Matrix - {split_name.title()} Set', fontsize=16, fontweight='bold')
+        plt.colorbar()
+        
+        # Add text annotations
+        thresh = confusion_mat.max() / 2.
+        for i in range(confusion_mat.shape[0]):
+            for j in range(confusion_mat.shape[1]):
+                plt.text(j, i, format(confusion_mat[i, j], 'd'),
+                        horizontalalignment="center",
+                        color="white" if confusion_mat[i, j] > thresh else "black",
+                        fontweight='bold')
+        
+        plt.ylabel('True Label', fontsize=14)
+        plt.xlabel('Predicted Label', fontsize=14)
+        plt.tight_layout()
+        
+        confusion_plot_name = f'confusion_matrix_{split_name}.png'
+        plt.savefig(confusion_plot_name, dpi=150, bbox_inches='tight')
+        mlflow.log_artifact(confusion_plot_name, 'plots')
+        plt.close()
+        
+        # Remove temporary file
+        if os.path.exists(confusion_plot_name):
+            os.remove(confusion_plot_name)
+        
+        # Log detailed cluster analysis
+        unique_labels = torch.unique(test_labels)
+        cluster_metrics = {}
+        
+        for label in unique_labels:
+            mask = test_labels == label
+            cluster_size = mask.sum().item()
+            cluster_metrics[f"cluster_{label.item()}_size"] = cluster_size
+            mlflow.log_metric(f"{split_name}_cluster_{label.item()}_size", cluster_size)
+        
+        # Log dataset information
+        mlflow.log_metric(f"{split_name}_total_nodes", len(test_labels))
+        mlflow.log_metric(f"{split_name}_num_clusters", len(unique_labels))
+        
+        print(f"Evaluation Results ({split_name} set, {len(test_labels)} nodes):")
+        print(f"  Clustering Loss: {test_loss.item():.4f}")
+        print(f"  Clustering Accuracy: {accuracy:.4f}")
+        print(f"  Number of Clusters: {len(unique_labels)}")
+        print(f"  Confusion Matrix Shape: {confusion_mat.shape}")
+        
         return {
-            'mse': mse_loss.item(),
-            'mae': mae_loss.item(),
-            'correlation': correlation,
-            'mean_relative_error': mean_relative_error.item(),
-            'num_nodes': mask.sum().item()
+            'loss': test_loss.item(),
+            'accuracy': accuracy,
+            'confusion_matrix': confusion_mat,
+            'num_nodes': len(test_labels),
+            'num_clusters': len(unique_labels),
+            'cluster_metrics': cluster_metrics
         }
 
 
 def save_trained_model(model, config, metrics, run_id):
     """
-    Save the trained model using MLflow model logging
+    Save the trained model using MLflow model logging with comprehensive metadata
     """
+    # Log the PyTorch model to MLflow
     mlflow.pytorch.log_model(
         model,
         "model",
-        registered_model_name="HypergraphGRAND_Distance"
+        registered_model_name="HypergraphGRAND_Clustering",
+        signature=None,
+        input_example=None,
+        await_registration_for=300  # Wait up to 5 minutes for registration
     )
+    
+    # Create model summary plot
+    plt.figure(figsize=(12, 8))
+    
+    # Model architecture summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    model_info = [
+        f"Model: HypergraphGRAND",
+        f"Total Parameters: {total_params:,}",
+        f"Trainable Parameters: {trainable_params:,}",
+        f"Input Dimension: {config['input_dim']}",
+        f"Hidden Dimension: {config['hidden_dim']}",
+        f"Number of Layers: {config['num_layers']}",
+        f"Alpha: {config['alpha']}",
+        f"Dropout: {config['dropout']}",
+        "",
+        f"Test Accuracy: {metrics['accuracy']:.4f}",
+        f"Test Loss: {metrics['loss']:.4f}",
+        f"Number of Clusters: {metrics['num_clusters']}",
+        f"Test Nodes: {metrics['num_nodes']}"
+    ]
+    
+    plt.text(0.1, 0.9, "\n".join(model_info), transform=plt.gca().transAxes, 
+             fontsize=12, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
+    plt.axis('off')
+    plt.title('Model Summary and Performance', fontsize=16, fontweight='bold', pad=20)
+    
+    model_summary_name = 'model_summary.png'
+    plt.savefig(model_summary_name, dpi=150, bbox_inches='tight')
+    mlflow.log_artifact(model_summary_name, 'model_info')
+    plt.close()
+    
+    # Remove temporary file
+    if os.path.exists(model_summary_name):
+        os.remove(model_summary_name)
+    
+    # Log model configuration as parameters (if not already logged)
+    for key, value in config.items():
+        try:
+            mlflow.log_param(f"model_{key}", value)
+        except:
+            pass  # Parameter might already be logged
 
     if HypergraphGRANDDeployment is not None:
         try:
@@ -250,109 +503,76 @@ def save_trained_model(model, config, metrics, run_id):
             return None, None
 
     print(f"Model logged to MLflow with run ID: {run_id}")
+    print(f"Model registered as: HypergraphGRAND_Clustering")
     return None, None
 
 
-def run_experiment(clustering_method='spectral', n_clusters=None, feature_dim=128, membership_type='enhanced'):
+def run_clustering_experiment(hidden_dim=4):
     """
-    Run a complete experiment on the merged dataset with train/val/test splits
+    Run clustering experiment: train on primary-school, test on high-school
     """
     print(f"\n{'='*60}")
-    print(f"Running experiment with merged datasets")
-    print(f"Clustering method: {clustering_method}")
-    print(f"Feature dimension: {feature_dim}")
-    print(f"Membership type: {membership_type}")
+    print(f"Running clustering experiment")
+    print(f"Training on: contact-primary-school")
+    print(f"Testing on: contact-high-school")
+    print(f"Hidden dimension: {hidden_dim}")
     print(f"{'='*60}")
 
-    dataset_paths = {
-        'contact-high-school': (
-            './datasets/contact-high-school/node-labels-contact-high-school.txt',
-            './datasets/contact-high-school/hyperedges-contact-high-school.txt'
-        ),
-        'contact-primary-school': (
-            './datasets/contact-primary-school/node-labels-contact-primary-school.txt',
-            './datasets/contact-primary-school/hyperedges-contact-primary-school.txt'
-        )
-    }
+    # Load training data (primary school)
+    print("\nLoading training dataset (contact-primary-school)...")
+    train_data = load_hypergraph_dataset('./datasets/contact-primary-school/')
+    
+    # Load testing data (high school)
+    print("\nLoading testing dataset (contact-high-school)...")
+    test_data = load_hypergraph_dataset('./datasets/contact-high-school/')
 
-    print("Loading and merging datasets...")
-    try:
-        data = load_and_split_datasets(
-            dataset_paths=dataset_paths,
-            train_ratio=0.6,
-            val_ratio=0.3,
-            test_ratio=0.1,
-            feature_dim=feature_dim,
-            membership_type=membership_type,
-            random_seed=42
-        )
-    except Exception as e:
-        print(f"Error loading datasets: {e}")
-        print("Please ensure dataset files are available in the datasets/ directory")
-        raise
+    # Extract cluster labels
+    train_labels = train_data['node_labels']
+    test_labels = test_data['node_labels']
 
-    x = data['x']
-    hyperedge_index = data['hyperedge_index']
-    membership = data['membership']
-    num_nodes = data['num_nodes']
-    num_hyperedges = data['num_hyperedges']
+    print(f"\nDataset Summary:")
+    print(f"Training ({train_data['dataset_name']}):")
+    print(f"  Nodes: {train_data['num_nodes']}, Hyperedges: {train_data['num_hyperedges']}")
+    print(f"  Clusters: {train_data['num_clusters']} -> {train_data['cluster_names']}")
+    print(f"Testing ({test_data['dataset_name']}):")
+    print(f"  Nodes: {test_data['num_nodes']}, Hyperedges: {test_data['num_hyperedges']}")
+    print(f"  Clusters: {test_data['num_clusters']} -> {test_data['cluster_names']}")
 
-    print("Dataset loaded successfully")
-    print(f"  Total nodes: {num_nodes}")
-    print(f"  Total hyperedges: {num_hyperedges}")
-    print(f"  Feature dimension: {x.size(1)}")
-    print(f"  Training nodes: {data['train_mask'].sum().item()}")
-    print(f"  Validation nodes: {data['val_mask'].sum().item()}")
-    print(f"  Test nodes: {data['test_mask'].sum().item()}")
+    # Log dataset parameters
+    mlflow.log_param("train_dataset", train_data['dataset_name'])
+    mlflow.log_param("test_dataset", test_data['dataset_name'])
+    mlflow.log_param("train_nodes", train_data['num_nodes'])
+    mlflow.log_param("test_nodes", test_data['num_nodes'])
+    mlflow.log_param("train_hyperedges", train_data['num_hyperedges'])
+    mlflow.log_param("test_hyperedges", test_data['num_hyperedges'])
+    mlflow.log_param("train_clusters", train_data['num_clusters'])
+    mlflow.log_param("test_clusters", test_data['num_clusters'])
+    mlflow.log_param("train_cluster_names", str(train_data['cluster_names']))
+    mlflow.log_param("test_cluster_names", str(test_data['cluster_names']))
+    mlflow.log_param("feature_dim", train_data['x'].size(1))
 
-    print("Detecting clusters and computing target distances...")
-    analyzer = HypergraphClusterAnalyzer(
-        method=clustering_method, n_clusters=n_clusters)
-    cluster_labels = analyzer.detect_clusters(
-        hyperedge_index, num_nodes, node_features=x)
-    target_distances = analyzer.compute_distances_to_centers(
-        hyperedge_index, num_nodes, normalize=True)
+    # Log comprehensive dataset information and visualizations
+    log_dataset_info(train_data, test_data, train_labels, test_labels)
 
-    data['target_distances'] = target_distances
-
-    cluster_info = analyzer.get_cluster_info()
-    print(f"Cluster analysis completed:")
-    print(f"  Number of clusters: {cluster_info['n_clusters']}")
-    print(f"  Cluster sizes: {cluster_info['cluster_sizes']}")
-    print(f"  Distance range: [{target_distances.min():.3f}, {
-          target_distances.max():.3f}]")
-
-    mlflow.log_param("merged_datasets", True)
-    mlflow.log_param("datasets", list(dataset_paths.keys()))
-    mlflow.log_param("clustering_method", clustering_method)
-    mlflow.log_param("num_nodes", num_nodes)
-    mlflow.log_param("num_hyperedges", num_hyperedges)
-    mlflow.log_param("num_clusters", cluster_info['n_clusters'])
-    mlflow.log_param("input_feature_dim", x.size(1))
-    mlflow.log_param("membership_type", membership_type)
-    mlflow.log_param("train_nodes", data['train_mask'].sum().item())
-    mlflow.log_param("val_nodes", data['val_mask'].sum().item())
-    mlflow.log_param("test_nodes", data['test_mask'].sum().item())
-
+    # Model configuration
     model_config = {
-        'input_dim': x.size(1),
-        'hidden_dim': 64,
-        'output_dim': 1,  # Single distance output
+        'input_dim': train_data['x'].size(1),
+        'hidden_dim': hidden_dim,
         'num_layers': 3,
         'alpha': 0.1,
         'dropout': 0.3
     }
 
+    # Log model hyperparameters
     for key, value in model_config.items():
         mlflow.log_param(key, value)
 
-    epochs = 1
-    learning_rate = 0.005
-    loss_type = 'huber'
+    # Training parameters
+    epochs = 100
+    learning_rate = 0.01
 
     mlflow.log_param("epochs", epochs)
     mlflow.log_param("learning_rate", learning_rate)
-    mlflow.log_param("loss_type", loss_type)
     mlflow.log_param("optimizer", "Adam")
 
     print("\nInitializing model...")
@@ -363,57 +583,60 @@ def run_experiment(clustering_method='spectral', n_clusters=None, feature_dim=12
 
     print(f"Model initialized with {model_params} parameters")
 
+    # Test forward pass
     print("\nTesting forward pass...")
     model.eval()
     with torch.no_grad():
-        out = model(x, hyperedge_index, membership=membership)
-        initial_loss = compute_distance_loss(out[data['train_mask']],
-                                             target_distances[data['train_mask']], loss_type)
+        out = model(train_data['x'], train_data['hyperedge_index'], membership=train_data['membership'])
+        initial_loss = clustering_loss_function(out, train_labels)
 
     mlflow.log_metric("initial_loss", initial_loss.item())
 
     print(f"""Tensor Shapes:
-  Input: {x.shape}
-  Hyperedge index: {hyperedge_index.shape}
-  Membership: {membership.shape}
-  Target distances: {target_distances.shape}
-  Output: {out.shape}""")
+  Train Input: {train_data['x'].shape}
+  Train Hyperedge index: {train_data['hyperedge_index'].shape}
+  Train Membership: {train_data['membership'].shape}
+  Train Labels: {train_labels.shape}
+  Train Output: {out.shape}""")
 
     print(f"Initial loss (train set): {initial_loss.item():.4f}")
 
+    # Train model
     print(f"\nTraining model for {epochs} epochs...")
-    model, loss_history, val_loss_history = train_model(
-        model, data, epochs=epochs, lr=learning_rate, loss_type=loss_type
+    model, loss_history, accuracy_history = train_clustering_model(
+        model, train_data, train_labels, epochs=epochs, lr=learning_rate
     )
 
-    print(f"\nEvaluating model...")
+    # Evaluate model on test data
+    print(f"\nEvaluating model on test data...")
+    test_metrics = evaluate_clustering_model(model, test_data, test_labels, split_name='test')
 
-    train_metrics = evaluate_model(model, data, split='train')
-
-    val_metrics = evaluate_model(model, data, split='val')
-
-    test_metrics = evaluate_model(model, data, split='test')
-
+    # Save model
     print(f"\nSaving model...")
     model_path, config_path = save_trained_model(
         model, model_config, test_metrics, mlflow.active_run().info.run_id)
 
-    mlflow.log_metric("final_test_mse", test_metrics['mse'])
-    mlflow.log_metric("final_test_correlation", test_metrics['correlation'])
+    # Log final summary metrics
+    mlflow.log_metric("final_test_loss", test_metrics['loss'])
+    mlflow.log_metric("final_test_accuracy", test_metrics['accuracy'])
 
-    return model, {'train': train_metrics, 'val': val_metrics, 'test': test_metrics}, loss_history
+    return model, test_metrics, loss_history
 
 
 if __name__ == "__main__":
+    # Setup MLflow
     setup_mlflow()
 
-    with mlflow.start_run(run_name="merged_datasets_distance_learning") as run:
+    # Run clustering experiments with different hidden dimensions
+    with mlflow.start_run(run_name="clustering_experiments") as run:
         try:
-            mlflow.set_tag("model_type", "HypergraphGRAND_Distance")
-            mlflow.set_tag("task_type", "distance_regression")
-            mlflow.set_tag("dataset_type", "merged_datasets")
+            mlflow.set_tag("model_type", "HypergraphGRAND_Clustering")
+            mlflow.set_tag("task_type", "clustering")
+            mlflow.set_tag("train_dataset", "contact-primary-school")
+            mlflow.set_tag("test_dataset", "contact-high-school")
             mlflow.set_tag("timestamp", datetime.now().isoformat())
 
+            # Check if dataset directories exist
             dataset_dirs = [
                 "./datasets/contact-high-school/",
                 "./datasets/contact-primary-school/"
@@ -427,97 +650,109 @@ if __name__ == "__main__":
             if missing_dirs:
                 error_msg = f"Dataset directories not found: {missing_dirs}"
                 print(error_msg)
-                print(
-                    "Please download the datasets and place them in the correct directories.")
+                print("Please download the datasets and place them in the correct directories.")
                 mlflow.log_param("error", "datasets_not_found")
                 mlflow.log_param("missing_dirs", missing_dirs)
                 mlflow.set_tag("status", "failed")
             else:
-                print("Running experiments with different configurations...")
+                # Run experiments with different hidden dimensions as per pseudocode
+                print("Running clustering experiments with different hidden dimensions...")
 
-                configs = [
-                    {
-                        'clustering_method': 'spectral',
-                        'feature_dim': 128,
-                        'membership_type': 'enhanced',
-                        'run_name': 'spectral_enhanced_128'
-                    },
-                    {
-                        'clustering_method': 'kmeans',
-                        'feature_dim': 128,
-                        'membership_type': 'enhanced',
-                        'run_name': 'kmeans_enhanced_128'
-                    },
-                    {
-                        'clustering_method': 'spectral',
-                        'feature_dim': 256,
-                        'membership_type': 'weighted',
-                        'run_name': 'spectral_weighted_256'
-                    }
-                ]
+                hidden_dims = [4, 8, 16]  # As specified in pseudocode
 
-                best_test_correlation = -1
-                best_config = None
+                best_test_accuracy = -1
+                best_hidden_dim = None
                 best_metrics = None
 
-                for i, config in enumerate(configs):
+                for hidden_dim in hidden_dims:
                     print(f"\n{'='*80}")
-                    print(f"Configuration {
-                          i+1}/{len(configs)}: {config['run_name']}")
+                    print(f"Hidden Dimension: {hidden_dim}")
                     print(f"{'='*80}")
 
-                    with mlflow.start_run(run_name=config['run_name'], nested=True) as nested_run:
+                    with mlflow.start_run(run_name=f"hidden_dim_{hidden_dim}", nested=True) as nested_run:
                         try:
-                            for key, value in config.items():
-                                if key != 'run_name':
-                                    mlflow.log_metric(key, value)
+                            # Log configuration
+                            mlflow.log_param("hidden_dim", hidden_dim)
 
-                            model, metrics, loss_history = run_experiment(
-                                clustering_method=config['clustering_method'],
-                                n_clusters=None,  # Auto-determine
-                                feature_dim=config['feature_dim'],
-                                membership_type=config['membership_type']
-                            )
+                            # Run experiment
+                            model, metrics, loss_history = run_clustering_experiment(hidden_dim=hidden_dim)
 
-                            test_correlation = metrics['test']['correlation']
-                            if test_correlation > best_test_correlation:
-                                best_test_correlation = test_correlation
-                                best_config = config
+                            # Track best configuration based on test accuracy
+                            test_accuracy = metrics['accuracy']
+                            if test_accuracy > best_test_accuracy:
+                                best_test_accuracy = test_accuracy
+                                best_hidden_dim = hidden_dim
                                 best_metrics = metrics
 
                             mlflow.set_tag("status", "completed")
 
-                            print(f"\n Configuration completed successfully!")
+                            print(f"\n✅ Hidden dim {hidden_dim} completed successfully!")
                             print(f"Test Metrics:")
-                            for metric_name, metric_value in metrics['test'].items():
-                                print(f"  {metric_name}: {metric_value:.4f}")
+                            print(f"  Loss: {metrics['loss']:.4f}")
+                            print(f"  Accuracy: {metrics['accuracy']:.4f}")
 
                         except Exception as e:
-                            error_msg = f"Configuration failed: {e}"
+                            error_msg = f"Hidden dim {hidden_dim} failed: {e}"
                             print(error_msg)
                             mlflow.log_param("error", "experiment_failed")
                             mlflow.log_param("error_message", str(e))
                             mlflow.set_tag("status", "failed")
                             continue
 
-                if best_config:
+                # Log best configuration to parent run
+                if best_hidden_dim:
                     print(f"\n{'='*80}")
-                    print(f"BEST CONFIGURATION: {best_config['run_name']}")
-                    print(f"Best Test Correlation: {
-                          best_test_correlation:.4f}")
+                    print(f"BEST CONFIGURATION: Hidden Dim = {best_hidden_dim}")
+                    print(f"Best Test Accuracy: {best_test_accuracy:.4f}")
                     print(f"{'='*80}")
 
-                    mlflow.log_param("best_config", best_config['run_name'])
-                    mlflow.log_metric("best_test_correlation",
-                                      best_test_correlation)
-                    for key, value in best_config.items():
-                        if key != 'run_name':
-                            mlflow.log_param(f"best_{key}", value)
-
-                    for split, split_metrics in best_metrics.items():
-                        for metric_name, metric_value in split_metrics.items():
-                            mlflow.log_metric(
-                                f"best_{split}_{metric_name}", metric_value)
+                    mlflow.log_param("best_hidden_dim", best_hidden_dim)
+                    mlflow.log_metric("best_test_accuracy", best_test_accuracy)
+                    mlflow.log_metric("best_test_loss", best_metrics['loss'])
+                    
+                    # Create experiment summary plot
+                    plt.figure(figsize=(12, 8))
+                    
+                    # Performance comparison across hidden dimensions
+                    plt.subplot(2, 2, 1)
+                    # This would need to be collected during the loop - simplified for now
+                    plt.bar(['Best Configuration'], [best_test_accuracy], color='green', alpha=0.7)
+                    plt.title('Best Test Accuracy', fontweight='bold')
+                    plt.ylabel('Accuracy')
+                    plt.ylim(0, 1)
+                    
+                    # Add text annotation
+                    plt.text(0, best_test_accuracy + 0.02, f'{best_test_accuracy:.4f}', 
+                            ha='center', fontweight='bold', fontsize=12)
+                    
+                    plt.subplot(2, 2, 2)
+                    plt.text(0.1, 0.9, f"Best Hidden Dimension: {best_hidden_dim}", 
+                            transform=plt.gca().transAxes, fontsize=14, fontweight='bold')
+                    plt.text(0.1, 0.7, f"Test Accuracy: {best_test_accuracy:.4f}", 
+                            transform=plt.gca().transAxes, fontsize=12)
+                    plt.text(0.1, 0.5, f"Test Loss: {best_metrics['loss']:.4f}", 
+                            transform=plt.gca().transAxes, fontsize=12)
+                    plt.text(0.1, 0.3, f"Clusters Predicted: {best_metrics['num_clusters']}", 
+                            transform=plt.gca().transAxes, fontsize=12)
+                    plt.axis('off')
+                    plt.title('Best Model Summary', fontweight='bold')
+                    
+                    plt.subplot(2, 1, 2)
+                    plt.text(0.5, 0.5, "Experiment completed successfully!\nCheck MLflow UI for detailed results.", 
+                            transform=plt.gca().transAxes, fontsize=16, fontweight='bold', 
+                            ha='center', va='center',
+                            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgreen", alpha=0.8))
+                    plt.axis('off')
+                    
+                    plt.tight_layout()
+                    summary_plot_name = 'experiment_summary.png'
+                    plt.savefig(summary_plot_name, dpi=150, bbox_inches='tight')
+                    mlflow.log_artifact(summary_plot_name, 'experiment_summary')
+                    plt.close()
+                    
+                    # Remove temporary file
+                    if os.path.exists(summary_plot_name):
+                        os.remove(summary_plot_name)
 
                 mlflow.set_tag("status", "completed")
 
@@ -529,6 +764,6 @@ if __name__ == "__main__":
             mlflow.set_tag("status", "failed")
 
     print("\n" + "="*60)
-    print("All experiments completed!")
+    print("All clustering experiments completed!")
     print("Check MLflow UI for detailed results: mlflow ui")
     print("="*60)
