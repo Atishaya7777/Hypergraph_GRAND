@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from typing import Optional
 from sklearn.cluster import KMeans
 from sklearn.metrics import confusion_matrix, accuracy_score
 
@@ -19,7 +20,7 @@ class HypergraphGRAND(nn.Module):
         num_layers: int = 3,
         alpha: float = 0.1,
         dropout: float = 0.1
-    ):
+    ) -> None:
         super().__init__()
 
         self.input_dim = input_dim
@@ -35,10 +36,20 @@ class HypergraphGRAND(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, x, hyperedge_index, hyperedge_weight=None, membership=None):
+    def forward(self, x: torch.Tensor, hyperedge_index: torch.Tensor,
+                hyperedge_weight: Optional[torch.Tensor] = None,
+                membership: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass through HyperGRAND
-        Returns latent representations for clustering analysis
+
+        Args:
+            x: Node features [num_nodes, input_dim]
+            hyperedge_index: Hyperedge connectivity [2, num_edges]
+            hyperedge_weight: Optional hyperedge weights
+            membership: Optional membership matrix [num_hyperedges, num_nodes]
+
+        Returns:
+            Latent representations [num_nodes, hidden_dim]
         """
         h = self.input_transform(x)
         h_init = h.clone()
@@ -46,6 +57,7 @@ class HypergraphGRAND(nn.Module):
         for layer in self.diffusion_layers:
             h = layer(h, h_init, hyperedge_index, hyperedge_weight, membership)
 
+        # Return latent representations for clustering
         return h
 
 
@@ -85,6 +97,8 @@ class HypergraphDiffusionLayer(nn.Module):
             grad, G, hyperedges, degrees, hyperedge_weight, membership, num_nodes)
 
         # Time discretization with residual connection
+        # Explicit Euler step. TODO: In the future, compare and contrast the
+        # explicit, implicit Euler methods and the Runge-Kutta methods.
         h_new = h_init + self.alpha * divergence
 
         # Apply layer normalization and dropout
@@ -95,7 +109,15 @@ class HypergraphDiffusionLayer(nn.Module):
 
     def compute_hypergraph_gradient(self, psi, hyperedges, degrees, hyperedge_weight=None, membership=None):
         """
-        Compute hypergraph gradient operator ∇ψ (optimized)
+        Compute hypergraph gradient operator
+
+        Args:
+            psi: Current feature representation of the nodes - A function from 
+                 nodes to R^d
+            hyperedges: A list of node sets for each hyperedge
+            degrees: A list of degrees for each node
+            hyperedge_weight: Optional Hyperedge weights
+            membership: Optional membership matrix [num_hyperedges, num_nodes]
         """
         if not hyperedges:
             return torch.zeros(0, self.hidden_dim, device=psi.device)
@@ -118,7 +140,9 @@ class HypergraphDiffusionLayer(nn.Module):
             mu_ref = 1.0 if membership is None else membership[e_idx, ref_node].item(
             )
             ref_term = (psi[ref_node] * mu_ref) / \
-                torch.sqrt(degrees[ref_node] + 1e-8)
+                torch.sqrt(
+                    # Adding a small epsilon for numerical stability
+                    degrees[ref_node] + 1e-8)
 
             for node in nodes_in_edge[1:]:  # Skip reference node
                 mu_node = 1.0 if membership is None else membership[e_idx, node].item(
@@ -137,7 +161,11 @@ class HypergraphDiffusionLayer(nn.Module):
 
     def compute_diffusion_tensor(self, psi, hyperedges, membership=None):
         """
-        Compute attention-based diffusion tensor G (optimized)
+        Compute attention-based diffusion tensor G
+            psi: Current feature representation of the nodes - A function from 
+                 nodes to R^d
+            hyperedges: A list of node sets for each hyperedge
+            membership: Optional membership matrix [num_hyperedges, num_nodes]
         """
         if not hyperedges:
             return torch.ones(0, device=psi.device)
@@ -174,7 +202,15 @@ class HypergraphDiffusionLayer(nn.Module):
 
     def compute_divergence(self, grad, G, hyperedges, degrees, hyperedge_weight=None, membership=None, num_nodes=None):
         """
-        Compute divergence operator div[G∇ψ] (optimized)
+        Compute divergence operator 
+
+        Args:
+            grad: The gradient tensor of the hypergraph.
+            G: The diffusion tensor based on the attention mechanism. Controls how much to diffuse.
+            degrees: A list of degrees for each node.
+            hyperedge_weight: Optional Hyperedge weights.
+            membership: Optional membership matrix [num_hyperedges, num_nodes]
+            num_nodes: The number of nodes in this hypergraph.
         """
         divergence = torch.zeros(
             num_nodes, self.hidden_dim, device=grad.device)
@@ -250,7 +286,7 @@ class HypergraphDiffusionLayer(nn.Module):
 
 def clustering_loss_function(model_output, node_labels):
     """
-    Clustering-based loss function as per pseudocode
+    Clustering-based loss function
 
     Args:
         model_output: Latent representations from model [num_nodes, hidden_dim]

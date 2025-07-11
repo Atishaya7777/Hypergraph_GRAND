@@ -9,4 +9,5 @@ mlflow
 scipy
 pandas
 numpy
-scikit-learn
+typing_extensions
+seaborn
