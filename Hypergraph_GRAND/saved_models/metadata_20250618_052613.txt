@@ -1,3 +1,0 @@
-training_accuracy: 1.0
-training_dataset: contact-primary-school
-timestamp: 2025-06-18T05:26:13.739118
