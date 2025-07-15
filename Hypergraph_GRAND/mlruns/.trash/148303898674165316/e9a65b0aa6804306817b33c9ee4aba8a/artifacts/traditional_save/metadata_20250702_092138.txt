@@ -1,3 +1,0 @@
-Model saved: 2025-07-02T09:21:38.283192
-Configuration: {'input_dim': 128, 'hidden_dim': 64, 'output_dim': 1, 'num_layers': 3, 'alpha': 0.1, 'dropout': 0.3}
-MLflow run ID: e9a65b0aa6804306817b33c9ee4aba8a

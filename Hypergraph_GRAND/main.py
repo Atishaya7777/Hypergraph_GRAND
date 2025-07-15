@@ -14,12 +14,9 @@ def main():
     np.random.seed(42)
 
     try:
-        # Run both approaches
         transductive_results = transductive_learning_approach()
         transfer_results = transfer_learning_approach()
 
-        # Print summary...
-        # Save results to file
         results_summary = {
             'transductive_results': transductive_results,
             'transfer_results': transfer_results,
