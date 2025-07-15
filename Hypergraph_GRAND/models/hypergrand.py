@@ -8,7 +8,6 @@ from .layers import HypergraphDiffusionLayer
 class HypergraphGRAND(nn.Module):
     """
     Hypergraph Graph Neural Diffusion (HyperGRAND) implementation
-    Optimized for clustering-based learning with latent representations
     """
 
     def __init__(
@@ -55,5 +54,5 @@ class HypergraphGRAND(nn.Module):
         for layer in self.diffusion_layers:
             h = layer(h, h_init, hyperedge_index, hyperedge_weight, membership)
 
-        # Return latent representations for clustering
+        # Return latent representations
         return h

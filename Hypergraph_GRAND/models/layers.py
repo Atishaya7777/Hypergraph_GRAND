@@ -171,6 +171,7 @@ class HypergraphDiffusionLayer(nn.Module):
 
             div_sum = torch.zeros(self.hidden_dim, device=grad.device)
 
+            # See the paper for more details. I won't bother with adding the latex derivation here in comments as that would be too long.
             for e_idx in node_to_edges[node]:
                 if e_idx >= len(G) or e_idx >= len(grad):
                     continue
@@ -180,7 +181,6 @@ class HypergraphDiffusionLayer(nn.Module):
                 mu_node = 1.0 if membership is None else membership[e_idx, node].item(
                 )
 
-                # Simplified computation
                 weight_factor = torch.sqrt(torch.tensor(
                     edge_weight, device=grad.device)) * mu_node
                 degree_term = max(1.0, (delta_e - 1) *

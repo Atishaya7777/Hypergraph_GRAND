@@ -2,11 +2,23 @@ import torch
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import confusion_matrix, accuracy_score, adjusted_rand_score
+from scipy.optimize import linear_sum_assignment
 
 
-def clustering_loss_function(embeddings, true_labels, lambda_sep=1.0, lambda_reg=0.01):
+def clustering_loss_function(
+    embeddings,
+    true_labels,
+    lambda_sep=1.0,
+    lambda_reg=0.01
+):
     """
-    Improved clustering loss with better separation and regularization
+    Clustering loss with separation and regularization included
+
+    Args:
+        embeddings: The latent representation represented as embeddings
+        true_labels: A list of true labels (The ground truth)
+        lambda_sep: The factor of which to scale the separate of the centroids by
+        lambda_reg: The regularization factor
     """
     device = embeddings.device
     unique_labels = torch.unique(true_labels)
@@ -31,7 +43,7 @@ def clustering_loss_function(embeddings, true_labels, lambda_sep=1.0, lambda_reg
         centroid = cluster_points.mean(dim=0)
         centroids.append(centroid)
 
-        # Intra-cluster loss: minimize distances within clusters
+        # Intra-cluster loss: minimize distances within clusters, just L^2
         distances_sq = torch.sum((cluster_points - centroid) ** 2, dim=1)
         intra_cluster_loss += distances_sq.sum()
         total_points += cluster_size
@@ -67,26 +79,31 @@ def clustering_loss_function(embeddings, true_labels, lambda_sep=1.0, lambda_reg
 
 def clustering_error_function(model_embeddings, true_labels, n_init=20):
     """
-    Improved clustering evaluation with better cluster assignment
+    Evaluate the predicted clusters with the actual true labels
+
+    Args:
+        model_embeddings: The latent representation represented as embeddings
+        true_labels: A list of true labels (The ground truth)
+        n_init: The number of times the KMeans algorithm is run with different centroid seeds 
     """
-    # Convert to numpy
     embeddings_np = model_embeddings.detach().cpu().numpy()
     true_labels_np = true_labels.cpu().numpy()
 
-    # Get number of true clusters
     n_clusters = len(np.unique(true_labels_np))
 
     if n_clusters <= 1:
         return np.eye(1), 0.0, 0.0
 
-    # Apply K-means with multiple initializations for stability
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42,
-                    n_init=n_init, max_iter=300)
+    kmeans = KMeans(
+        n_clusters=n_clusters,
+        random_state=42,
+        n_init=n_init,
+        max_iter=300
+    )
 
     try:
         predicted_clusters = kmeans.fit_predict(embeddings_np)
-    except:
-        # Fallback if K-means fails
+    except Exception:
         predicted_clusters = np.zeros(len(true_labels_np))
 
     # Compute ARI (this doesn't require label mapping)
@@ -97,7 +114,6 @@ def clustering_error_function(model_embeddings, true_labels, n_init=20):
 
     # Find optimal assignment using Hungarian algorithm
     try:
-        from scipy.optimize import linear_sum_assignment
         # Convert to maximization problem
         cost_matrix = -cm
         row_indices, col_indices = linear_sum_assignment(cost_matrix)
@@ -117,7 +133,6 @@ def clustering_error_function(model_embeddings, true_labels, n_init=20):
         final_cm = confusion_matrix(true_labels_np, mapped_predictions)
 
     except ImportError:
-        # Fallback if scipy is not available
         print("Warning: scipy not available, using suboptimal cluster assignment")
         accuracy = accuracy_score(true_labels_np, predicted_clusters)
         final_cm = cm

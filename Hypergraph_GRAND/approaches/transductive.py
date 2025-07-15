@@ -7,10 +7,10 @@ from training import HypergraphTrainer
 
 def transductive_learning_approach():
     """
-    Approach 1: Transductive learning on each dataset individually
+    Transductive learning on each dataset individually
     """
     print("="*60)
-    print("APPROACH 1: TRANSDUCTIVE LEARNING")
+    print("TRANSDUCTIVE LEARNING")
     print("="*60)
 
     datasets = {

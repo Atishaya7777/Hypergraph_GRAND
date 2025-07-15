@@ -18,7 +18,6 @@ class ContactDataset:
         """
         Load hypergraph data from files
         """
-        # Load node labels
         node_labels_file = os.path.join(
             self.data_path, f"node-labels-{self.dataset_name}.txt")
         with open(node_labels_file, 'r') as f:
@@ -28,7 +27,6 @@ class ContactDataset:
         self.labels = torch.tensor(labels, dtype=torch.long)
         self.num_classes = len(torch.unique(self.labels))
 
-        # Load hyperedges
         hyperedges_file = os.path.join(
             self.data_path, f"hyperedges-{self.dataset_name}.txt")
         hyperedges = []
@@ -43,7 +41,6 @@ class ContactDataset:
                 hyperedges.append(nodes)
                 max_node_id = max(max_node_id, max(nodes))
 
-        # Verify consistency between node labels and hyperedges
         if max_node_id >= self.num_nodes:
             print(f"Warning: Max node ID in hyperedges ({
                   max_node_id}) >= num_nodes ({self.num_nodes})")
@@ -65,7 +62,6 @@ class ContactDataset:
 
         for edge_id, nodes in enumerate(hyperedges):
             for node_id in nodes:
-                # Ensure node_id is within bounds
                 if node_id < 0 or node_id >= self.num_nodes:
                     raise ValueError(
                         f"Node ID {node_id} is out of bounds [0, {self.num_nodes-1}]")
@@ -75,7 +71,6 @@ class ContactDataset:
         self.hyperedge_index = torch.tensor(
             [edge_indices, node_indices], dtype=torch.long)
 
-        # Load label names (optional)
         label_names_file = os.path.join(
             self.data_path, f"label-names-{self.dataset_name}.txt")
         try:
@@ -84,7 +79,7 @@ class ContactDataset:
         except FileNotFoundError:
             self.label_names = [f"Class_{i}" for i in range(self.num_classes)]
 
-        # Create node features (using one-hot encoding of node indices as simple features)
+        # Using one hot encoding, basically just an identity matrix
         self.node_features = torch.eye(self.num_nodes)
 
         print(f"Dataset {self.dataset_name} loaded:")
@@ -98,8 +93,12 @@ class ContactDataset:
         print(f"  - Node ID range: [0, {max_node_id}]")
 
 
-def create_transductive_split(labels: torch.Tensor, train_ratio: float = 0.6,
-                              val_ratio: float = 0.2, random_state: int = 42) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def create_transductive_split(
+    labels: torch.Tensor,
+    train_ratio: float = 0.6,
+    val_ratio: float = 0.2,
+    random_state: int = 42
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create transductive split - stratified by class
     """
@@ -113,12 +112,11 @@ def create_transductive_split(labels: torch.Tensor, train_ratio: float = 0.6,
     val_mask = torch.zeros(n_nodes, dtype=torch.bool)
     test_mask = torch.zeros(n_nodes, dtype=torch.bool)
 
-    # Stratified split for each class
     for class_id in unique_classes:
         class_indices = torch.where(labels == class_id)[0]
         n_class = len(class_indices)
 
-        # Shuffle indices for this class
+        # Randomly permute the indices for the classes so that there is no visible bias
         perm = torch.randperm(n_class)
         class_indices = class_indices[perm]
 
