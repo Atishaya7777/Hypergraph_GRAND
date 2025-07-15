@@ -11,3 +11,4 @@ pandas
 numpy
 typing_extensions
 seaborn
+numba
