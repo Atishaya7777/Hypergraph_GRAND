@@ -1,2 +1,6 @@
 venv/*
-Message_Passing/*
+.git/*
+__pycache__/*
+mlruns/*
+logs/*
+mlflow_plots/*

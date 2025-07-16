@@ -1,5 +1,6 @@
 import torch
 import mlflow
+import mlflow.pytorch
 
 from data import ContactDataset, create_transductive_split
 from models import HypergraphGRAND
@@ -77,6 +78,8 @@ def transfer_learning_approach():
             "test_accuracy", source_test_results['test_accuracy'])
         mlflow.log_metric("test_loss", source_test_results['test_loss'])
 
+        mlflow.pytorch.log_model(source_model, artifact_path="model")
+
     print(f"\n{'='*20} PHASE 2: TRANSFER TO HIGH SCHOOL {'='*20}")
 
     with mlflow.start_run(run_name="Transfer Learning to High School"):
@@ -130,6 +133,8 @@ def transfer_learning_approach():
             "test_accuracy", target_test_results['test_accuracy'])
         mlflow.log_metric("test_loss", target_test_results['test_loss'])
 
+        mlflow.pytorch.log_model(target_model, artifact_path="model")
+
     print(f"\n{'='*20} BASELINE: TRAIN FROM SCRATCH ON HIGH SCHOOL {'='*20}")
 
     with mlflow.start_run(run_name="Baseline Training on High School"):
@@ -168,6 +173,8 @@ def transfer_learning_approach():
         mlflow.log_metric(
             "test_accuracy", baseline_test_results['test_accuracy'])
         mlflow.log_metric("test_loss", baseline_test_results['test_loss'])
+
+        mlflow.pytorch.log_model(baseline_model, artifact_path="model")
 
     print(f"\n{'='*20} TRANSFER LEARNING COMPARISON {'='*20}")
     print(f"Transfer Learning Test Accuracy: {
