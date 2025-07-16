@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/06fa20d1ad944d01b4f665fc8395d63b/artifacts
+deleted_time: 1752624477413
+end_time: 1752624326566
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: deleted
+run_id: 06fa20d1ad944d01b4f665fc8395d63b
+run_name: Hypergraph GRAND Transductive contact-high-school
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1752624184801
+status: 3
+tags: []
+user_id: atishayamaharjan
