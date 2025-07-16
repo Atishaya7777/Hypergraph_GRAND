@@ -101,7 +101,7 @@ class HypergraphTrainer:
               train_mask: torch.Tensor,
               val_mask: torch.Tensor,
               optimizer: torch.optim.Optimizer,
-              num_epochs: int = 10,
+              num_epochs: int = 100,
               visualize_epochs: list = []) -> Dict:
         """
         Trains the model for multiple epochs and optionally visualizes at specific epochs.
@@ -239,4 +239,3 @@ class HypergraphTrainer:
             'test_ari': test_ari,
             'confusion_matrix': confusion_matrix
         }
-

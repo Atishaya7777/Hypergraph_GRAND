@@ -58,7 +58,7 @@ def transductive_learning_approach():
                 model.parameters(), lr=0.01, weight_decay=1e-5)
 
             train_results = trainer.train(
-                data, train_mask, val_mask, optimizer, num_epochs=10)
+                data, train_mask, val_mask, optimizer, num_epochs=100)
 
             test_results = trainer.evaluate(data, test_mask)
 

@@ -84,7 +84,7 @@ def transfer_learning_approach():
 
     with mlflow.start_run(run_name="Transfer Learning to High School"):
         target_model = HypergraphGRAND(
-            input_dim=hyperparams["input_dim"],
+            input_dim=target_data.num_nodes,
             hidden_dim=hyperparams["hidden_dim"],
             num_layers=hyperparams["num_layers"],
             # Higher alpha value for sparser high school network
@@ -115,7 +115,7 @@ def transfer_learning_approach():
             target_train_mask,
             target_val_mask,
             target_optimizer,
-            num_epochs=10
+            num_epochs=100
         )
 
         target_test_results = target_trainer.evaluate(
@@ -155,7 +155,7 @@ def transfer_learning_approach():
             target_train_mask,
             target_val_mask,
             baseline_optimizer,
-            num_epochs=10
+            num_epochs=100
         )
 
         baseline_test_results = baseline_trainer.evaluate(
