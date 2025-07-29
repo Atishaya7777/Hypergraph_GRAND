@@ -1,3 +1,3 @@
-from .dataset import ContactDataset, create_transductive_split
+from .dataset import ContactDataset, DataSplitter, HypergraphData, create_hypergraph_dataset
 
-__all__ = ['ContactDataset', 'create_transductive_split']
+__all__ = ['ContactDataset', 'DataSplitter', 'HypergraphData', 'create_hypergraph_dataset']

@@ -2,10 +2,9 @@ import torch
 import mlflow
 import mlflow.pytorch
 
-from data import ContactDataset, create_transductive_split
+from data import ContactDataset, DataSplitter 
 from models import HypergraphGRAND
 from training import HypergraphTrainer
-
 
 def transfer_learning_approach():
     """
@@ -23,9 +22,9 @@ def transfer_learning_approach():
 
     # Transfer leraning from the primary school dataset to the high school dataset
     # I selected the primary school dataset as our source as it has fewer nodes but more dense structure.
-    source_train_mask, source_val_mask, source_test_mask = create_transductive_split(
+    source_train_mask, source_val_mask, source_test_mask = DataSplitter.create_transductive_split(
         source_data.labels)
-    target_train_mask, target_val_mask, target_test_mask = create_transductive_split(
+    target_train_mask, target_val_mask, target_test_mask = DataSplitter.create_transductive_split(
         target_data.labels)
 
     print(f"\n{'='*20} PHASE 1: PRE-TRAINING ON PRIMARY SCHOOL {'='*20}")
