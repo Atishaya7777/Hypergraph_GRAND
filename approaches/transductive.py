@@ -2,38 +2,77 @@ import torch
 import mlflow
 import mlflow.pytorch
 
-from data import ContactDataset, create_transductive_split
+from data import ContactDataset, DataSplitter 
+from data.dataset import create_hypergraph_dataset
 from models import HypergraphGRAND
-from training import HypergraphTrainer
+from training.trainer import create_hypergraph_trainer
 
-
-def transductive_learning_approach():
+# NOTE: For now, I'm just going to differentiate between my datasets using strings. Later, adapt this to be a factory builder method.
+def transductive_learning_approach(dataset_name: str, strategy: str = 'clustering'):
     """
     Transductive learning on each dataset individually
+    Args:
+        dataset_name: ['contact', 'planetoid', 'planetoid_cora', 'planetoid_citeseer', 'planetoid_pubmed']
+        strategy: ['classification', 'clustering']
     """
     print("="*60)
     print("TRANSDUCTIVE LEARNING")
     print("="*60)
 
-    datasets = {
-        'contact-high-school': 'datasets/contact-high-school',
-        'contact-primary-school': 'datasets/contact-primary-school'
-    }
+    datasets = {}
+
+    dataset_name = dataset_name.lower()
+
+    if(dataset_name == 'contact'):
+        datasets.update({
+            'contact-high-school': 'datasets/contact-high-school',
+            'contact-primary-school': 'datasets/contact-primary-school',
+        })
+    elif dataset_name == 'planetoid_cora':
+        datasets.update({
+            'planetoid_cora': 'datasets/cora'
+        })
+    elif dataset_name == 'planetoid_citeseer':
+        datasets.update({
+            'planetoid_citeseer': 'datasets/citeseer'
+        })
+    elif dataset_name == 'planetoid_pubmed':
+        datasets.update({
+            'planetoid_pubmed': 'datasets/pubmed'
+        })
+
 
     results = {}
+
+    print(f"Datasets: ", datasets.items())
 
     for dataset_name, dataset_path in datasets.items():
         print(f"\n{'='*20} {dataset_name.upper()} {'='*20}")
 
         with mlflow.start_run(run_name=f"Hypergraph GRAND Transductive {dataset_name}"):
 
-            data = ContactDataset(dataset_path, dataset_name)
+            datasetFactory = create_hypergraph_dataset(dataset_name)
+            data = datasetFactory.load_data(dataset_path)
 
-            train_mask, val_mask, test_mask = create_transductive_split(
-                data.labels)
+            if(dataset_name != 'contact'):
+                # train_mask, val_mask, test_mask = DataSplitter.create_transductive_split(data.labels)
+                train_mask = data.train_mask
+                val_mask = data.val_mask
+                test_mask = data.test_mask
+            else:
+                train_mask, val_mask, test_mask = DataSplitter.create_transductive_split(
+                    data.labels
+                )
+
+            if dataset_name.startswith('planetoid'):
+                # For Planetoid datasets, use feature dimension
+                input_dim = data.node_features.shape[1]
+            else:
+                # For contact datasets (identity features), use number of nodes
+                input_dim = data.num_nodes
 
             hyperparams = {
-                "input_dim": data.num_nodes,
+                "input_dim": input_dim,
                 "hidden_dim": 16,
                 "num_layers": 3,
                 "alpha": 0.1,
@@ -52,13 +91,18 @@ def transductive_learning_approach():
 
             device = torch.device(
                 'cuda' if torch.cuda.is_available() else 'cpu')
-            trainer = HypergraphTrainer(model, device)
+            trainer = create_hypergraph_trainer(
+                task_type=strategy,
+                model=model,
+                device=device,
+                num_classes=data.num_classes # This will not matter if the strategy is clustering, it'll just not get forwarded to the clustering trainer
+            ) 
 
             optimizer = torch.optim.Adam(
                 model.parameters(), lr=0.01, weight_decay=1e-5)
 
             train_results = trainer.train(
-                data, train_mask, val_mask, optimizer, num_epochs=100)
+                data, train_mask, val_mask, optimizer, num_epochs=10)
 
             test_results = trainer.evaluate(data, test_mask)
 

@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import json
 
-from approaches.transfer import transfer_learning_approach
 from approaches.transductive import transductive_learning_approach
 
 
@@ -15,12 +14,12 @@ def main():
     np.random.seed(42)
 
     try:
-        transductive_results = transductive_learning_approach()
-        transfer_results = transfer_learning_approach()
+        transductive_results = transductive_learning_approach(dataset_name='planetoid_cora',strategy='classification')
+        # transfer_results = transfer_learning_approach()
 
         results_summary = {
             'transductive_results': transductive_results,
-            'transfer_results': transfer_results,
+            # 'transfer_results': transfer_results,
             'timestamp': str(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')
         }
 

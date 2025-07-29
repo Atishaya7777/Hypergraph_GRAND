@@ -1,5 +1,5 @@
-# HypergraphGRAND Clustering Makefile
-# Manages virtual environment, dependencies, and clustering experiments
+# HypergraphGRAND Makefile
+# Manages virtual environment, dependencies, and experiments
 # Uses enhanced train.py with MLflow integration
 
 VENV_NAME = venv
@@ -27,7 +27,7 @@ default: check-and-run
 
 .PHONY: check-and-run
 check-and-run:
-	@echo "$(BLUE) Starting HypergraphGRAND clustering workflow...$(NC)"
+	@echo "$(BLUE) Starting HypergraphGRAND workflow...$(NC)"
 	@echo "$(CYAN) Training on contact-high-school, testing on contact-primary-school$(NC)"
 	@echo "$(BLUE)Step 1: Checking virtual environment...$(NC)"
 	@if [ ! -d "$(VENV_NAME)" ]; then \
@@ -37,24 +37,20 @@ check-and-run:
 	else \
 		echo "$(GREEN)✓ Virtual environment exists$(NC)"; \
 	fi
-	@echo "$(BLUE)Step 2: Checking datasets...$(NC)"
-	@$(MAKE) dataset-check
-	@echo "$(BLUE)Step 3: Running clustering experiments with MLflow...$(NC)"
+	@echo "$(BLUE)Step 2: Running experiments with MLflow...$(NC)"
 	@mkdir -p $(LOG_DIR) $(SAVED_MODELS_DIR)
 	@$(PYTHON_VENV) $(MAIN_FILE)
-	@echo "$(GREEN)🎉 Clustering experiments completed successfully!$(NC)"
-	@echo "$(CYAN)💡 View results with: make mlflow$(NC)"
+	@echo "$(GREEN) Experiments completed successfully!$(NC)"
+	@echo "$(CYAN) View results with: make mlflow$(NC)"
 
 .PHONY: help
 help:
-	@echo "$(BLUE)HypergraphGRAND Clustering Project Makefile$(NC)"
+	@echo "$(BLUE)HypergraphGRAND Project Makefile$(NC)"
 	@echo "============================================="
-	@echo ""
-	@echo "$(CYAN) Clustering Task: Train on contact-high-school, test on contact-primary-school$(NC)"
 	@echo ""
 	@echo "$(GREEN) Quick Start:$(NC)"
 	@echo "  make             - Complete workflow: setup → check datasets → run experiments"
-	@echo "  make run         - Run clustering experiments with MLflow tracking"
+	@echo "  make run         - Run experiments with MLflow tracking"
 	@echo "  make mlflow      - Start MLflow UI to view experiment results"
 	@echo ""
 	@echo "$(GREEN) Setup Commands:$(NC)"
@@ -119,7 +115,7 @@ deps: install
 
 .PHONY: dataset-check
 dataset-check:
-	@echo "$(BLUE) Checking datasets for clustering experiments...$(NC)"
+	@echo "$(BLUE) Checking datasets for experiments...$(NC)"
 	@mkdir -p $(TRAIN_DATASET_DIR) $(TEST_DATASET_DIR)
 	@echo ""
 	@echo "$(CYAN) Training Dataset (contact-high-school):$(NC)"
@@ -156,7 +152,7 @@ dataset-check:
 		echo "$(YELLOW) Please ensure all dataset files are in the correct directories$(NC)"; \
 		exit 1; \
 	else \
-		echo "$(GREEN) All dataset files ready for clustering experiments!$(NC)"; \
+		echo "$(GREEN) All dataset files ready for experiments!$(NC)"; \
 	fi
 
 .PHONY: dataset-info
@@ -189,7 +185,7 @@ dataset-info: dataset-check
 
 .PHONY: run
 run: venv install dataset-check
-	@echo "$(BLUE) Running HypergraphGRAND clustering experiments...$(NC)"
+	@echo "$(BLUE) Running HypergraphGRAND experiments...$(NC)"
 	@echo "$(CYAN) Enhanced training with MLflow tracking$(NC)"
 	@mkdir -p $(LOG_DIR) $(SAVED_MODELS_DIR)
 	@$(PYTHON_VENV) train.py
