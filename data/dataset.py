@@ -138,7 +138,6 @@ class ContactDataLoader(DataLoader):
                 nodes = [int(x) for x in line.strip().split(',')]
                 hyperedges.append(nodes)
 
-        # Load label names (optional)
         label_names_file = path / f"label-names-{dataset_name}.txt"
         if not label_names_file.exists():
             label_names_file = path / "label-names.txt"
@@ -164,7 +163,6 @@ class CoraDataLoader(DataLoader):
         """Load Cora dataset from content and cites files"""
         path = Path(path).expanduser()
 
-        # Load content file
         content_path = path / 'cora.content'
         if not content_path.exists():
             raise FileNotFoundError(f"Cora content file not found at {content_path}")
@@ -181,7 +179,6 @@ class CoraDataLoader(DataLoader):
         features = content_df.iloc[:, 1:-1].values.astype(float)
         labels = content_df.iloc[:, -1].values
 
-        # Load edges
         cites_path = path / 'cora.cites'
         edges = []
 
@@ -218,7 +215,9 @@ class GraphToHypergraphConverter(HypergraphConverter):
         self.strategy_map = {
             'star_expansion': self._star_expansion,
             'clique_expansion': self._clique_expansion,
-            'neighborhood_expansion': self._neighborhood_expansion
+            'neighborhood_expansion': self._neighborhood_expansion,
+            'co_citation_expansion': self._co_citation_expansion,
+            'citation_expansion': self._citation_expansion,
         }
 
         if strategy not in self.strategy_map:
@@ -250,7 +249,6 @@ class GraphToHypergraphConverter(HypergraphConverter):
         if edge_array.shape[1] == 0:
             return []
 
-        # Build adjacency list
         adj_list = defaultdict(set)
         for i in range(edge_array.shape[1]):
             u, v = int(edge_array[0, i]), int(edge_array[1, i])
@@ -284,7 +282,6 @@ class GraphToHypergraphConverter(HypergraphConverter):
         if edge_array.shape[1] == 0:
             return []
         
-        # Build adjacency list
         adj_list = defaultdict(set)
         for i in range(edge_array.shape[1]):
             u, v = int(edge_array[0, i]), int(edge_array[1, i])
@@ -310,6 +307,81 @@ class GraphToHypergraphConverter(HypergraphConverter):
                 seen.add(he_tuple)
         
         return unique_hyperedges
+    
+    def _co_citation_expansion(self, edge_array: np.ndarray, num_nodes: int, **kwargs) -> List[List[int]]:
+        """
+        Convert citation edges to co-citation hyperedges.
+
+        For each paper, create a hyperedge containing all papers it cites.
+        This works for Cora, Citeseer, and Pubmed
+        This follows the method described in Yadati et al., 2019 Link: https://arxiv.org/pdf/2207.06680#cite.yadati2019hypergcn
+        """
+
+        if edge_array.shape[1] == 0:
+            return []
+
+        # Build outgoing citation lists for each paper
+        # outgoing_citations[paper_id] = list of papers that paper_id cites
+        outgoing_citations = defaultdict(list)
+
+        for i in range(edge_array.shape[1]):
+            citing_paper = int(edge_array[0, i])
+            cited_paper = int(edge_array[1, i])
+            outgoing_citations[citing_paper].append(cited_paper)
+
+        hyperedges = []
+
+        for citing_paper in range(num_nodes):
+            cited_papers = outgoing_citations.get(citing_paper, [])
+
+            # Only create hyperedge if paper cites at least 2 others
+            # Single citations don't really create any meaningful hyperedges
+            if len(cited_papers) >= 2:
+                hyperedge = sorted(cited_papers)
+                hyperedges.append(hyperedge)
+
+        unique_hyperedges = []
+        seen = set()
+        for he in hyperedges:
+            he_tuple = tuple(he)
+            if he_tuple not in seen:
+                unique_hyperedges.append(he)
+                seen.add(he_tuple)
+
+        return unique_hyperedges
+        
+    def _citation_expansion(self, edge_array: np.ndarray, num_nodes: int, **kwargs) -> List[List[int]]:
+        """Citing papers method: papers citing the same target form a hyperedge"""
+        if edge_array.shape[1] == 0:
+            return []
+        
+        incoming_citations = defaultdict(list)
+        
+        for i in range(edge_array.shape[1]):
+            citing_paper = int(edge_array[0, i])
+            cited_paper = int(edge_array[1, i])
+            incoming_citations[cited_paper].append(citing_paper)
+        
+        hyperedges = []
+        min_citers = kwargs.get('min_citers', 2)  # Minimum citers to form hyperedge
+        
+        for cited_paper in range(num_nodes):
+            citing_papers = incoming_citations.get(cited_paper, [])
+            
+            if len(citing_papers) >= min_citers:
+                hyperedge = sorted(citing_papers)
+                hyperedges.append(hyperedge)
+        
+        unique_hyperedges = []
+        seen = set()
+        for he in hyperedges:
+            he_tuple = tuple(he)
+            if he_tuple not in seen:
+                unique_hyperedges.append(he)
+                seen.add(he_tuple)
+        
+        return unique_hyperedges
+
 
 
 class IdentityHypergraphConverter(HypergraphConverter):
@@ -385,7 +457,7 @@ class HypergraphDataset(ABC):
 class PlanetoidHypergraphDataset(HypergraphDataset):
     """Dataset class for Planetoid data converted to hypergraph format"""
 
-    def __init__(self, dataset_name: str = 'Cora', hypergraph_strategy: str = 'star_expansion'):
+    def __init__(self, dataset_name: str = 'Cora', hypergraph_strategy: str = 'star_expansion', normalize_features: bool = True):
         """
         Initialize Planetoid hypergraph dataset
 
@@ -399,6 +471,48 @@ class PlanetoidHypergraphDataset(HypergraphDataset):
         )
         self.dataset_name = dataset_name
         self.hypergraph_strategy = hypergraph_strategy
+        self.normalize_features=normalize_features
+
+    def load_raw_data(self, path: Union[str, Path]) -> Dict:
+        """Overriding the default load_raw_data to use the one which conserves the tensors"""
+        path = Path(path).expanduser()
+
+        dataset = Planetoid(root=str(path), name=self.dataset_name)
+        data = dataset[0]
+
+        features = data.x
+
+        if features is not None and self.normalize_features:
+            features = self._normalize_features(features)
+        elif features is None:
+            features = None
+
+        labels = data.y
+        edges = data.edge_index
+
+        train_mask = data.train_mask if hasattr(data, 'train_mask') else None
+        val_mask = data.val_mask if hasattr(data, 'val_mask') else None
+        test_mask = data.test_mask if hasattr(data, 'test_mask') else None
+
+        return {
+            'features': features,
+            'labels': labels,
+            'edges': edges,
+            'train_mask': train_mask,
+            'val_mask': val_mask,
+            'test_mask': test_mask,
+            'num_classes': dataset.num_classes,
+            'num_features': dataset.num_features,
+            'dataset_name': self.dataset_name.lower(),
+            'dataset_info': {
+                'num_nodes': data.num_nodes,
+                'num_edges': data.num_edges,
+                'avg_degree': data.num_edges / data.num_nodes,
+                'is_undirected': data.is_undirected(),
+                'has_self_loops': data.has_self_loops(),
+                'has_isolated_nodes': data.has_isolated_nodes()
+            }
+        }
 
     def load_data(self, path: Union[str, Path], **kwargs) -> HypergraphData:
         """Load Planetoid dataset and convert to hypergraph format"""
@@ -455,6 +569,13 @@ class PlanetoidHypergraphDataset(HypergraphDataset):
 
         return self._data
 
+    def _normalize_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply row-wise L1 normalization to features (same as NormalizeFeatures transform)"""
+        row_sum = features.sum(dim=1, keepdim=True)
+        row_sum = torch.where(row_sum == 0, torch.ones_like(row_sum))
+
+        return features/row_sum
+
     def _print_dataset_info(self):
         """Print dataset information"""
         data = self._data
@@ -471,7 +592,6 @@ class PlanetoidHypergraphDataset(HypergraphDataset):
         print(f"  - Hypergraph strategy: {info['hypergraph_strategy']}")
         print(f"  - Is undirected: {info['is_undirected']}")
         
-        # Print train/val/test split info if available
         if hasattr(data, 'train_mask') and data.train_mask is not None:
             print(f"  - Training nodes: {data.train_mask.sum().item()}")
             print(f"  - Validation nodes: {data.val_mask.sum().item()}")
@@ -490,34 +610,26 @@ class ContactDataset(HypergraphDataset):
     
     def load_data(self, path: Union[str, Path], **kwargs) -> HypergraphData:
         """Load contact network dataset"""
-        # Load raw data
         raw_data = self.data_loader.load_raw_data(path)
         
-        # Convert to hypergraph format (normalize indices)
         hyperedges = self.converter.convert_to_hypergraph(raw_data, **kwargs)
         
-        # Process labels
         labels = torch.tensor(raw_data['labels'], dtype=torch.long)
         num_nodes = len(labels)
         num_classes = len(torch.unique(labels))
         
-        # Validate node indices
         self.validator.validate_node_indices(hyperedges, num_nodes)
         
-        # Create features (identity matrix)
         node_features = torch.eye(num_nodes)
         
-        # Create hyperedge index
         hyperedge_index = self._create_hyperedge_index(hyperedges)
         
-        # Compute statistics
         stats = self._compute_dataset_stats(hyperedges, num_nodes)
         stats.update({
             'dataset_name': raw_data['dataset_name'],
             'dataset_type': 'contact_network'
         })
         
-        # Create data container
         self._data = HypergraphData(
             node_features=node_features,
             labels=labels,
@@ -529,7 +641,6 @@ class ContactDataset(HypergraphDataset):
             dataset_info=stats
         )
         
-        # Validate complete data
         self.validator.validate_hypergraph_data(self._data)
         
         self._print_dataset_info()
@@ -554,8 +665,8 @@ class DataSplitter:
     @staticmethod
     def create_transductive_split(
         labels: torch.Tensor,
-        train_ratio: float = 0.6,
-        val_ratio: float = 0.2,
+        train_ratio: float = 0.5,
+        val_ratio: float = 0.25,
         random_state: int = 42
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Create stratified transductive split"""
@@ -604,8 +715,8 @@ def create_hypergraph_dataset(dataset_type: str, **kwargs) -> HypergraphDataset:
         else:
             dataset_name = kwargs.get('dataset_name', 'Cora')
 
-        strategy = kwargs.get('hypergraph_strategy', 'clique_expansion')
-        return PlanetoidHypergraphDataset(dataset_name=dataset_name, hypergraph_strategy=strategy)
+        strategy = kwargs.get('hypergraph_strategy', 'co_citation_expansion')
+        return PlanetoidHypergraphDataset(dataset_name=dataset_name, hypergraph_strategy=strategy, normalize_features=True)
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
