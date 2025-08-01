@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/4917beb7cfdf4fba8490c1ffa6871607/artifacts
+deleted_time: 1752677347225
+end_time: 1752628731077
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: deleted
+run_id: 4917beb7cfdf4fba8490c1ffa6871607
+run_name: Transfer Learning to High School
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1752628616213
+status: 3
+tags: []
+user_id: atishayamaharjan

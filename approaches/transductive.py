@@ -91,9 +91,10 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
                 num_layers=hyperparams["num_layers"],
                 alpha=hyperparams["alpha"],
                 dropout=hyperparams["dropout"],
-                scheme="implicit",
-                max_iter=15,
-                tol=1e-5
+                scheme="adaptive",
+                min_alpha=0.005,
+                max_alpha=0.3,
+                tol=1e-4
             )
             
             device = torch.device(

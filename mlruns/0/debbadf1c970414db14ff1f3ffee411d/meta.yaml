@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/debbadf1c970414db14ff1f3ffee411d/artifacts
+deleted_time: 1752677347225
+end_time: 1752628889355
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: deleted
+run_id: debbadf1c970414db14ff1f3ffee411d
+run_name: serious-eel-751
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1752628889348
+status: 3
+tags: []
+user_id: atishayamaharjan

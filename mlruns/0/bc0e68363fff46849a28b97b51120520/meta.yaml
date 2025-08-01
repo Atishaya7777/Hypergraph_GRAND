@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/bc0e68363fff46849a28b97b51120520/artifacts
+deleted_time: 1753807273406
+end_time: 1753806856201
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: deleted
+run_id: bc0e68363fff46849a28b97b51120520
+run_name: Hypergraph GRAND Transductive cora
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1753806856197
+status: 4
+tags: []
+user_id: atishayamaharjan

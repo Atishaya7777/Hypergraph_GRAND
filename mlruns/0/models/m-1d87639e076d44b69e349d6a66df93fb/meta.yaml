@@ -1,0 +1,10 @@
+artifact_location: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/models/m-1d87639e076d44b69e349d6a66df93fb/artifacts
+creation_timestamp: 1753830015869
+experiment_id: '0'
+last_updated_timestamp: 1753830017838
+model_id: m-1d87639e076d44b69e349d6a66df93fb
+model_type: null
+name: model
+source_run_id: 0a5d23a881d74a0581d6e9c2aa19568c
+status: 2
+status_message: null
