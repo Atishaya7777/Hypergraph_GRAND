@@ -1,6 +1,4 @@
 venv/*
 .git/*
-__pycache__/*
-mlruns/*
+**/__pycache__/
 logs/*
-mlflow_plots/*

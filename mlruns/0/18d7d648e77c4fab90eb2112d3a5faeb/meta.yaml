@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/18d7d648e77c4fab90eb2112d3a5faeb/artifacts
+end_time: 1752635871690
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 18d7d648e77c4fab90eb2112d3a5faeb
+run_name: Pretraining on Primary School
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1752635622546
+status: 3
+tags: []
+user_id: atishayamaharjan

@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/b0591cbf9e6546b1bb4474aff48fa70c/artifacts
+deleted_time: 1753820627701
+end_time: 1753820509102
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: deleted
+run_id: b0591cbf9e6546b1bb4474aff48fa70c
+run_name: Simple_GCN_Baseline_Cora
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1753820506516
+status: 3
+tags: []
+user_id: atishayamaharjan

@@ -1,0 +1,15 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/4e08cf091b7648c780ddb28efd1b77a8/artifacts
+deleted_time: 1753819200960
+end_time: 1753819183927
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: deleted
+run_id: 4e08cf091b7648c780ddb28efd1b77a8
+run_name: Hypergraph GRAND Transductive planetoid_citeseer
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1753819179678
+status: 4
+tags: []
+user_id: atishayamaharjan

@@ -4,7 +4,7 @@ import mlflow.pytorch
 
 from data import ContactDataset, DataSplitter 
 from data.dataset import create_hypergraph_dataset
-from models import HypergraphGRAND
+from models import HypergraphGRAND, create_hypergrand_model
 from training.trainer import create_hypergraph_trainer
 
 # NOTE: For now, I'm just going to differentiate between my datasets using strings. Later, adapt this to be a factory builder method.
@@ -54,8 +54,7 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
             datasetFactory = create_hypergraph_dataset(dataset_name)
             data = datasetFactory.load_data(dataset_path)
 
-            if(dataset_name != 'contact'):
-                # train_mask, val_mask, test_mask = DataSplitter.create_transductive_split(data.labels)
+            if(dataset_name == 'contact'):
                 train_mask = data.train_mask
                 val_mask = data.val_mask
                 test_mask = data.test_mask
@@ -73,22 +72,31 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
 
             hyperparams = {
                 "input_dim": input_dim,
-                "hidden_dim": 16,
-                "num_layers": 3,
-                "alpha": 0.1,
-                "dropout": 0.1
+                "hidden_dim": 32,
+                "num_layers": 2,
+                "alpha": 0.02,
+                "dropout": 0.5
             }
 
             mlflow.log_params(hyperparams)
 
-            model = HypergraphGRAND(
+            scheme_defaults = {
+                    "implicit": {"max_iter": 10, "tol": 1e-6},
+                    "adaptive": {"min_alpha": 0.01, "max_alpha": 0.5, "tol": 1e-4}
+                }
+
+            model = create_hypergrand_model(
                 input_dim=hyperparams["input_dim"],
                 hidden_dim=hyperparams["hidden_dim"],
                 num_layers=hyperparams["num_layers"],
                 alpha=hyperparams["alpha"],
-                dropout=hyperparams["dropout"]
+                dropout=hyperparams["dropout"],
+                scheme="adaptive",
+                min_alpha=0.005,
+                max_alpha=0.3,
+                tol=1e-4
             )
-
+            
             device = torch.device(
                 'cuda' if torch.cuda.is_available() else 'cpu')
             trainer = create_hypergraph_trainer(
@@ -99,10 +107,10 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
             ) 
 
             optimizer = torch.optim.Adam(
-                model.parameters(), lr=0.01, weight_decay=1e-5)
+                model.parameters(), lr=0.001, weight_decay=5e-4)
 
             train_results = trainer.train(
-                data, train_mask, val_mask, optimizer, num_epochs=10)
+                data, train_mask, val_mask, optimizer, num_epochs=100)
 
             test_results = trainer.evaluate(data, test_mask)
 
@@ -125,3 +133,5 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
             print(f"  - Test Loss: {test_results['test_loss']:.4f}")
 
     return results
+
+
