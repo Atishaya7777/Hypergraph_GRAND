@@ -14,7 +14,17 @@ def main():
     np.random.seed(42)
 
     try:
-        transductive_results = transductive_learning_approach(dataset_name='planetoid_cora',strategy='classification')
+        # Test different edge dropout rates
+        edge_dropout_rates = [0.5, 0.6, 0.75]
+        
+        transductive_results = transductive_learning_approach(
+            dataset_name='planetoid_cora',
+            strategy='classification',
+            edge_dropout_rates=edge_dropout_rates,
+            num_epochs=5000,
+            patience=1000,
+            log_detailed_params=True
+        )
         # transfer_results = transfer_learning_approach()
 
         results_summary = {

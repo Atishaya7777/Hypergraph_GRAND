@@ -14,6 +14,57 @@ from utils import visualize_embeddings_tsne, plot_metric_over_epochs
 
 # TODO: Refactor this file to branch out and code split the various classes
 
+class EarlyStopping:
+    """Early stopping utility"""
+    
+    def __init__(self, patience: int = 1000, min_delta: float = 1e-6, 
+                 monitor: str = 'val_accuracy', mode: str = 'max'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.monitor = monitor
+        self.mode = mode
+        self.wait = 0
+        self.best_score = None
+        self.should_stop = False
+        
+        if mode == 'max':
+            self.monitor_op = np.greater
+            self.min_delta *= 1
+        else:
+            self.monitor_op = np.less
+            self.min_delta *= -1
+    
+    def __call__(self, current_score: float) -> bool:
+        """
+        Check if training should stop
+        
+        Args:
+            current_score: Current validation score
+            
+        Returns:
+            True if training should stop
+        """
+        if self.best_score is None:
+            self.best_score = current_score
+            return False
+        
+        if self.monitor_op(current_score, self.best_score + self.min_delta):
+            self.best_score = current_score
+            self.wait = 0
+        else:
+            self.wait += 1
+            
+        if self.wait >= self.patience:
+            self.should_stop = True
+            return True
+            
+        return False
+    
+    def reset(self):
+        """Reset early stopping state"""
+        self.wait = 0
+        self.best_score = None
+        self.should_stop = False
 
 class BaseHypergraphTrainer(ABC):
     """
@@ -43,7 +94,7 @@ class BaseHypergraphTrainer(ABC):
                     ) -> Tuple[float, float, float, float]:
         """Train the model for one epoch."""
         pass
-    
+
     @abstractmethod
     def evaluate(self,
                  data: HypergraphData,
@@ -89,6 +140,74 @@ class BaseHypergraphTrainer(ABC):
         
         self._print_best_results(best_metric, best_epoch + 1)
         return self._get_training_results(best_epoch, best_metric)
+
+    def training_with_early_stopping(self,
+                                     data: HypergraphData,
+                                     train_mask: torch.Tensor,
+                                     val_mask: torch.Tensor,
+                                     optimizer: torch.optim.Optimizer,
+                                     num_epochs: int=5000,
+                                     patience: int =1000,
+                                     log_interval=100):
+
+        early_stopping = EarlyStopping(
+            patience=patience,
+            monitor='val_accuracy' if hasattr(self.base_trainer, 'val_accuracies') else 'val_ari',
+            mode='max')
+
+        best_metric = self.base_trainer._get_initial_best_metric()
+        best_epoch = 0
+        
+        # Training loop
+        for epoch in range(num_epochs):
+            # Train one epoch
+            should_visualize = False  # Can be customized
+            metrics = self.base_trainer.train_epoch(
+                data, train_mask, val_mask, optimizer, epoch + 1, should_visualize
+            )
+            
+            # Update internal metrics
+            self.base_trainer._update_metrics(metrics)
+            self.base_trainer._log_metrics_to_mlflow(metrics, epoch)
+            
+            # Get current metric for early stopping
+            current_metric = self.base_trainer._get_current_metric(metrics)
+            
+            # Update best metric
+            if self.base_trainer._is_better_metric(current_metric, best_metric):
+                best_metric = current_metric
+                best_epoch = epoch
+            
+            # Logging
+            if (epoch + 1) % log_interval == 0 or epoch == num_epochs - 1:
+                self.base_trainer._print_epoch_progress(epoch + 1, num_epochs, metrics)
+                
+                # Log additional edge dropout info
+                mlflow.log_metrics({
+                    'edge_dropout_rate': self.edge_dropout.dropout_rate,
+                    'edges_kept_ratio': 1.0 - self.edge_dropout.dropout_rate
+                }, step=epoch)
+            
+            # Check early stopping
+            if early_stopping(current_metric):
+                print(f"Early stopping triggered at epoch {epoch + 1}")
+                print(f"Best metric: {best_metric:.4f} at epoch {best_epoch + 1}")
+                break
+        
+        # Print final results
+        self.base_trainer._print_best_results(best_metric, best_epoch + 1)
+        
+        # Return enhanced results
+        base_results = self.base_trainer._get_training_results(best_epoch, best_metric)
+        base_results.update({
+            'total_epochs': epoch + 1,
+            'stopped_early': early_stopping.should_stop,
+            'edge_dropout_rate': self.edge_dropout.dropout_rate,
+            'patience_used': patience
+        })
+        
+        return base_results
+
     
     @abstractmethod
     def _print_training_info(self, data, train_mask, val_mask, visualize_epochs):
