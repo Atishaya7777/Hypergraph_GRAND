@@ -36,28 +36,48 @@ class ExplicitEulerIntegrator(BaseIntegrator):
 
 
 class ImplicitEulerIntegrator(BaseIntegrator):
-    """Implicit Euler integration: h_{t+1} = h_0 + α * f(h_{t+1})"""
-    
-    def __init__(self, alpha: float = 0.1, max_iter: int = 10, tol: float = 1e-6):
+    """Implicit Euler with fixed-point iteration (practical version)."""
+
+    def __init__(self, alpha: float = 0.1, max_iter: int = 10, tol: float = 1e-6, relaxation: float = 1.0, verbose: bool = False):
         super().__init__(alpha)
         self.max_iter = max_iter
         self.tol = tol
-    
-    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, 
-             diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
-        # Fixed point iteration for implicit method
-        h_new = h_current.clone()
-        
-        for _ in range(self.max_iter):
-            h_prev = h_new.clone()
-            divergence = diffusion_fn(h_new, *args, **kwargs)
-            h_new = h_init + self.alpha * divergence
-            
-            # Check convergence
-            if torch.norm(h_new - h_prev) < self.tol:
+        self.relaxation = relaxation  # 1.0 = full update; <1.0 = under-relaxation
+        self.verbose = verbose
+
+    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
+        """
+        Do fixed-point iteration in torch.no_grad() to avoid building an enormous graph.
+        After convergence, compute one final differentiable evaluation (small graph).
+        """
+        device = h_current.device
+        # Start from a detached iterate to avoid graph building across iterations
+        h_new = h_current.detach().clone().to(device)
+
+        converged = False
+        for it in range(self.max_iter):
+            h_prev = h_new
+            # iteration done without tracking grads
+            with torch.no_grad():
+                divergence = diffusion_fn(h_new, *args, **kwargs)   # heavy, but no graph
+                candidate = h_init + self.alpha * divergence
+                # relaxation to improve stability
+                h_new = h_prev + self.relaxation * (candidate - h_prev)
+
+            # check convergence (use 2-norm)
+            diff_norm = torch.norm(h_new - h_prev)
+            if diff_norm < self.tol:
+                converged = True
                 break
-                
-        return h_new
+
+        if not converged and self.verbose:
+            print(f"[ImplicitIntegrator] fixed-point did NOT converge (iter={it+1}/{self.max_iter}) final_norm={diff_norm:.4e}")
+
+        # final differentiable evaluation: create a fresh tensor that requires grad
+        # and evaluate diffusion_fn once to create a small graph for backward.
+        h_final = h_new.clone().detach().requires_grad_(True)
+        divergence_final = diffusion_fn(h_final, *args, **kwargs)
+        return h_init + self.alpha * divergence_final
 
 
 class MultistepIntegrator(BaseIntegrator):
@@ -161,42 +181,37 @@ class HypergraphDiffusionLayer(nn.Module):
             raise ValueError(f"Unknown integration scheme: {scheme}")
 
     def forward(self, h, h_init, hyperedge_index, hyperedge_weight=None, membership=None):
-        """Apply one step of hypergraph diffusion"""
-        device = h.device
+            """Apply one step of hypergraph diffusion"""
 
-        def diffusion_function(h_input):
-            return self._compute_diffusion_step(
-                h_input, hyperedge_index, hyperedge_weight, membership
-            )
+            device = h.device
+            # precompute hyperedge structure and degrees once (avoid rebuilding inside integrator loops)
+            hyperedges = self.get_hyperedge_structure(hyperedge_index)
+            degrees = self.compute_node_degrees(hyperedge_index, h.size(0))
 
-        # Run integrator step (this returns the "divergence" integrated into an update)
-        h_new = self.integrator.step(h, h_init, diffusion_function)
+            def diffusion_function(h_input):
+                # note: pass precomputed hyperedges & degrees to avoid recomputing per iteration
+                return self._compute_diffusion_step(h_input, hyperedges, degrees, hyperedge_weight, membership)
 
-        # Normalize + dropout
-        h_new = self.layer_norm(h_new)
-        h_new = F.dropout(h_new, p=self.dropout, training=self.training)
+            # Run integrator step (this may perform several iterations for implicit integrator)
+            h_new = self.integrator.step(h, h_init, diffusion_function)
 
-        return h_new
+            # Normalize + dropout
+            h_new = self.layer_norm(h_new)
+            h_new = F.dropout(h_new, p=self.dropout, training=self.training)
 
-    def _compute_diffusion_step(self, h, hyperedge_index, hyperedge_weight=None, membership=None):
-        """Compute divergence = aggregated contributions from hyperedges"""
+            return h_new
+
+    def _compute_diffusion_step(self, h, hyperedges, degrees, hyperedge_weight=None, membership=None):
+        """Compute the divergence using precomputed hyperedges and degrees"""
         num_nodes = h.size(0)
-        device = h.device
-
-        # Prepare hyperedge lists
-        hyperedges = self.get_hyperedge_structure(hyperedge_index)
-        degrees = self.compute_node_degrees(hyperedge_index, num_nodes)  # [num_nodes]
 
         # If no hyperedges, return zero divergence
         if len(hyperedges) == 0:
             return torch.zeros_like(h)
 
-        # Compute gradient per hyperedge (keeps original semantics, but avoids creating scalars)
+        # reuse your existing methods that accept hyperedges, degrees
         grad = self.compute_hypergraph_gradient(h, hyperedges, degrees, hyperedge_weight, membership)
-        # Compute diffusion tensor (attention-based per-hyperedge scalar)
-        G = self.compute_diffusion_tensor(h, hyperedges, membership)  # [num_hyperedges]
-
-        # Divergence: distribute hyperedge contributions back to nodes
+        G = self.compute_diffusion_tensor(h, hyperedges, membership)
         divergence = self.compute_divergence(grad, G, hyperedges, degrees, hyperedge_weight, membership, num_nodes)
         return divergence
 

@@ -388,7 +388,7 @@ def main():
     parser.add_argument('--hyperedge_type', type=str, default='citation',
                        choices=['edge', 'co_citation', 'citation'],
                        help='How to convert graph to hypergraph')
-    parser.add_argument('--edge_dropout', type=float, default=0.1, help='Edge dropout probability')
+    parser.add_argument('--edge_dropout', type=float, default=0.5, help='Edge dropout probability')
     parser.add_argument('--edge_dropout_type', type=str, default='connection',
                        choices=['connection', 'hyperedge', 'none'],
                        help='Type of edge dropout: connection-level or hyperedge-level')
