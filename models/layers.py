@@ -226,7 +226,7 @@ class HypergraphDiffusionLayer(nn.Module):
                 node_term = (psi[node] * mu_node) / torch.sqrt(degrees[node] + 1e-8)
                 grad_sum += node_term - ref_term
 
-            scale = torch.sqrt(torch.tensor(edge_weight, device=psi.device)) / \
+            scale = torch.sqrt(edge_weight) / \
                 torch.sqrt(torch.tensor(delta_e - 1, dtype=torch.float, device=psi.device))
             gradients.append(scale * grad_sum)
 
@@ -289,7 +289,7 @@ class HypergraphDiffusionLayer(nn.Module):
                 delta_e = len(hyperedges[e_idx])
                 mu_node = 1.0 if membership is None else membership[e_idx, node].item()
 
-                weight_factor = torch.sqrt(torch.tensor(edge_weight, device=grad.device)) * mu_node
+                weight_factor = torch.sqrt(edge_weight) * mu_node
                 degree_term = max(1.0, (delta_e - 1) * (degrees[node].item() + 1e-8))
                 norm_factor = torch.sqrt(torch.tensor(degree_term, device=grad.device))
 

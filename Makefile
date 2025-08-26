@@ -11,7 +11,7 @@ TEST_DATASET_DIR = datasets/contact-primary-school
 LOG_DIR = logs
 SAVED_MODELS_DIR = saved_models
 REQUIREMENTS_FILE = requirements.txt
-MAIN_FILE = main.py
+MAIN_FILE = testing.py
 
 # Color codes for output
 BLUE = \033[0;34m
