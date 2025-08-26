@@ -1,5 +1,5 @@
 artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/0fa2c344832046d9979d1fadcc4349d7/artifacts
-end_time: null
+end_time: 1754666772963
 entry_point_name: ''
 experiment_id: '0'
 lifecycle_stage: active
@@ -9,6 +9,6 @@ source_name: ''
 source_type: 4
 source_version: ''
 start_time: 1754602822412
-status: 1
+status: 3
 tags: []
 user_id: atishayamaharjan

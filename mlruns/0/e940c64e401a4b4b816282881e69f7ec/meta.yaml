@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/atishayamaharjan/Research/TerraByte/Scripts/Hypergraph_GRAND/mlruns/0/e940c64e401a4b4b816282881e69f7ec/artifacts
+end_time: 1755284748070
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: e940c64e401a4b4b816282881e69f7ec
+run_name: HyperGRAND_Transductive_planetoid_cora_dropout_0.6
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1755274751783
+status: 4
+tags: []
+user_id: atishayamaharjan

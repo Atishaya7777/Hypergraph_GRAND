@@ -592,6 +592,7 @@ class PlanetoidHypergraphDataset(HypergraphDataset):
         print(f"  - Hypergraph strategy: {info['hypergraph_strategy']}")
         print(f"  - Is undirected: {info['is_undirected']}")
         
+        # TODO: Rework this section so that if we use our custom stratified training/test/val split, it reflects accordingly
         if hasattr(data, 'train_mask') and data.train_mask is not None:
             print(f"  - Training nodes: {data.train_mask.sum().item()}")
             print(f"  - Validation nodes: {data.val_mask.sum().item()}")

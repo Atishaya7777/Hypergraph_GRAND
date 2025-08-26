@@ -15,7 +15,7 @@ def main():
 
     try:
         # Test different edge dropout rates
-        edge_dropout_rates = [0.5, 0.6, 0.75]
+        edge_dropout_rates = [0.75, 0.6, 0.5]
         
         transductive_results = transductive_learning_approach(
             dataset_name='planetoid_cora',

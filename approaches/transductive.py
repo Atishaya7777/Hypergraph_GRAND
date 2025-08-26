@@ -175,7 +175,7 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
                     test_mask = data.test_mask
                 else:
                     train_mask, val_mask, test_mask = DataSplitter.create_transductive_split(
-                        data.labels
+                        data.labels,
                     )
 
                 # Determine input dimension
@@ -189,13 +189,13 @@ def transductive_learning_approach(dataset_name: str, strategy: str = 'clusterin
                     "input_dim": input_dim,
                     "hidden_dim": 32,
                     "num_layers": 2,
-                    "alpha": 0.02,
+                    "alpha": 0.2,
                     "dropout": 0.5,
                     "scheme": "explicit",
                     "edge_dropout_rate": edge_dropout_rate,
                     "num_epochs": num_epochs,
                     "patience": patience,
-                    "learning_rate": 0.001,
+                    "learning_rate": 0.01,
                     "weight_decay": 5e-4,
                     "strategy": strategy,
                     "dataset_name": dataset_name,
