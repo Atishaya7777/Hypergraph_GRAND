@@ -1,329 +1,224 @@
+import os
+import time
+import argparse
+from typing import Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch_geometric.datasets import Planetoid
-import numpy as np
-import time
-from typing import Tuple, Optional
-import argparse
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch_geometric.nn import GCNConv
 
-# Import your model
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+# import your model factory (unchanged)
 from models.hypergrand import HypergraphGRAND, create_hypergrand_model
 from models.layers import IntegrationScheme
 
+# --------------------------
+# Utilities (hyperedge builders, dropout etc.)
+# --------------------------
+def hyperedge_dropout(hyperedge_index: torch.Tensor,
+                      hyperedge_weight: Optional[torch.Tensor] = None,
+                      p: float = 0.1,
+                      training: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not training or p == 0.0 or hyperedge_index.size(1) == 0:
+        return hyperedge_index, hyperedge_weight
+    num_connections = hyperedge_index.size(1)
+    keep_mask = torch.rand(num_connections, device=hyperedge_index.device) >= p
+    if keep_mask.sum() == 0:
+        keep_mask[0] = True
+    dropped_hyperedge_index = hyperedge_index[:, keep_mask]
+    if hyperedge_weight is not None:
+        remaining_hyperedges = torch.unique(dropped_hyperedge_index[0])
+        hyperedge_mapping = torch.zeros(hyperedge_weight.size(0), dtype=torch.long, device=hyperedge_index.device)
+        hyperedge_mapping[remaining_hyperedges] = torch.arange(len(remaining_hyperedges), device=hyperedge_index.device)
+        dropped_hyperedge_index[0] = hyperedge_mapping[dropped_hyperedge_index[0]]
+        dropped_hyperedge_weight = hyperedge_weight[remaining_hyperedges]
+    else:
+        dropped_hyperedge_weight = None
+    return dropped_hyperedge_index, dropped_hyperedge_weight
+
+def structural_hyperedge_dropout(hyperedge_index: torch.Tensor,
+                                 hyperedge_weight: Optional[torch.Tensor] = None,
+                                 p: float = 0.1,
+                                 training: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not training or p == 0.0 or hyperedge_index.size(1) == 0:
+        return hyperedge_index, hyperedge_weight
+    unique_hyperedges = torch.unique(hyperedge_index[0])
+    num_hyperedges = len(unique_hyperedges)
+    keep_mask = torch.rand(num_hyperedges, device=hyperedge_index.device) >= p
+    if keep_mask.sum() == 0:
+        keep_mask[0] = True
+    kept_hyperedges = unique_hyperedges[keep_mask]
+    connection_mask = torch.isin(hyperedge_index[0], kept_hyperedges)
+    dropped_hyperedge_index = hyperedge_index[:, connection_mask]
+    hyperedge_mapping = torch.zeros(int(hyperedge_index[0].max().item()) + 1, dtype=torch.long,
+                                   device=hyperedge_index.device)
+    hyperedge_mapping[kept_hyperedges] = torch.arange(len(kept_hyperedges), device=hyperedge_index.device)
+    dropped_hyperedge_index[0] = hyperedge_mapping[dropped_hyperedge_index[0]]
+    if hyperedge_weight is not None:
+        dropped_hyperedge_weight = hyperedge_weight[kept_hyperedges]
+    else:
+        dropped_hyperedge_weight = None
+    return dropped_hyperedge_index, dropped_hyperedge_weight
+
+def graph_to_hypergraph(edge_index: torch.Tensor, num_nodes: int,
+                        hyperedge_type: str = "co_citation"):
+    if hyperedge_type == "edge":
+        num_edges = edge_index.size(1)
+        hyperedge_index = torch.zeros(2, num_edges * 2, dtype=torch.long)
+        for i in range(num_edges):
+            hyperedge_index[0, 2 * i] = i
+            hyperedge_index[1, 2 * i] = edge_index[0, i]
+            hyperedge_index[0, 2 * i + 1] = i
+            hyperedge_index[1, 2 * i + 1] = edge_index[1, i]
+        return hyperedge_index, None
+    elif hyperedge_type == "co_citation":
+        cited_by = {i: [] for i in range(num_nodes)}
+        for i in range(edge_index.size(1)):
+            citing = edge_index[0, i].item()
+            cited = edge_index[1, i].item()
+            cited_by[cited].append(citing)
+        hyperedge_connections = []
+        hyperedge_weights = []
+        hid = 0
+        for cited_paper in range(num_nodes):
+            citing = cited_by[cited_paper]
+            if len(citing) >= 2:
+                nodes = [cited_paper] + citing
+                nodes = sorted(list(set(nodes)))
+                for n in nodes:
+                    hyperedge_connections.append([hid, n])
+                hyperedge_weights.append(len(citing))
+                hid += 1
+        if hyperedge_connections:
+            return torch.tensor(hyperedge_connections, dtype=torch.long).t(), torch.tensor(hyperedge_weights, dtype=torch.float)
+        else:
+            return torch.zeros(2, 0, dtype=torch.long), None
+    elif hyperedge_type == "citation":
+        cites = {i: [] for i in range(num_nodes)}
+        for i in range(edge_index.size(1)):
+            a = edge_index[0, i].item()
+            b = edge_index[1, i].item()
+            cites[a].append(b)
+        hyperedge_connections = []
+        hyperedge_weights = []
+        hid = 0
+        for a in range(num_nodes):
+            cited = cites[a]
+            if len(cited) >= 1:
+                nodes = [a] + cited
+                nodes = sorted(list(set(nodes)))
+                for n in nodes:
+                    hyperedge_connections.append([hid, n])
+                hyperedge_weights.append(len(cited))
+                hid += 1
+        if hyperedge_connections:
+            return torch.tensor(hyperedge_connections, dtype=torch.long).t(), torch.tensor(hyperedge_weights, dtype=torch.float)
+        else:
+            return torch.zeros(2, 0, dtype=torch.long), None
+    else:
+        raise ValueError(f"Unknown hyperedge_type {hyperedge_type}")
+
+def create_train_only_hypergraph(edge_index, train_mask, num_nodes, hyperedge_type):
+    train_nodes = set(torch.where(train_mask)[0].tolist())
+    train_edges = []
+    for i in range(edge_index.size(1)):
+        s = edge_index[0, i].item()
+        t = edge_index[1, i].item()
+        if s in train_nodes and t in train_nodes:
+            train_edges.append([s, t])
+    if not train_edges:
+        return torch.zeros(2, 0, dtype=torch.long), None
+    train_ei = torch.tensor(train_edges, dtype=torch.long).t()
+    return graph_to_hypergraph(train_ei, num_nodes, hyperedge_type)
+
+def create_full_split(data, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
+    num_nodes = data.x.size(0)
+    indices = torch.randperm(num_nodes)
+    tr = int(train_ratio * num_nodes)
+    vr = tr + int(val_ratio * num_nodes)
+    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
+    train_mask[indices[:tr]] = True
+    val_mask[indices[tr:vr]] = True
+    test_mask[indices[vr:]] = True
+    return train_mask, val_mask, test_mask
+
+def load_planetoid_data(name: str, root: str = "./data"):
+    dataset = Planetoid(root=root, name=name)
+    data = dataset[0]
+    print(f"Dataset: {name}")
+    print(f"Nodes: {data.x.size(0)}, Edges: {data.edge_index.size(1)}, Feat dim: {data.x.size(1)}, Classes: {dataset.num_classes}")
+    print(f"Train nodes: {int(data.train_mask.sum())}, Val nodes: {int(data.val_mask.sum())}, Test nodes: {int(data.test_mask.sum())}")
+    return data, dataset.num_classes
+
+# --------------------------
+# Classifier wrapper that keeps encoder independent but adds a small residual skip and head
+# --------------------------
 class HypergraphClassifier(nn.Module):
-    def __init__(self, encoder: HypergraphGRAND, num_classes: int):
+    def __init__(self, encoder: HypergraphGRAND, num_classes: int, dropout: float = 0.0):
         super().__init__()
         self.encoder = encoder
-        self.classifier = nn.Linear(encoder.hidden_dim, num_classes)  # task head
+        enc_h = encoder.hidden_dim
+        self.hidden_dim = enc_h
+        # classifier MLP with batchnorm
+        self.head = nn.Sequential(
+            nn.Linear(enc_h, enc_h),
+            nn.BatchNorm1d(enc_h),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(enc_h, num_classes)
+        )
+        # small projection from input features for skip/residual (keeps encoder usable as encoder)
+        self.input_proj = nn.Identity()
+        if hasattr(encoder, "input_transform"):
+            # reuse encoder input transform if available (keeps shapes aligned)
+            self.input_proj = encoder.input_transform
+        else:
+            self.input_proj = nn.Linear(encoder.input_dim, enc_h)
+        # init head
+        for m in self.head:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x, hyperedge_index, hyperedge_weight=None, membership=None):
-        h = self.encoder(x, hyperedge_index, hyperedge_weight, membership)  # [N, hidden_dim]
-        logits = self.classifier(h)  # [N, num_classes]
-        return logits, h  # return both for flexibility
+    def forward(self, x, hyperedge_index, hyperedge_weight=None, membership=None, return_embedding=False):
+        h_enc = self.encoder(x, hyperedge_index, hyperedge_weight, membership)  # [N, enc_h]
+        # residual: combine with simple projection of inputs (helps classifier discriminate)
+        h_skip = self.input_proj(x)
+        # simple sum with scaling to avoid blowing magnitude
+        h = 0.6 * h_enc + 0.4 * h_skip
+        logits = self.head(h)
+        if return_embedding:
+            return logits, h
+        return logits
 
-# This should get 80-85% on Cora with full split
+# Simple GCN baseline kept for comparison
 class SimpleGCN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5):
         super().__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, output_dim)
         self.dropout = dropout
-    
     def forward(self, x, edge_index):
         x = F.relu(self.conv1(x, edge_index))
         x = F.dropout(x, p=self.dropout, training=self.training)
         return self.conv2(x, edge_index)
 
-
-def hyperedge_dropout(hyperedge_index: torch.Tensor, 
-                     hyperedge_weight: Optional[torch.Tensor] = None,
-                     p: float = 0.1, 
-                     training: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Apply dropout to hyperedge connections.
-    
-    Args:
-        hyperedge_index: [2, num_connections] hyperedge connectivity
-        hyperedge_weight: optional hyperedge weights
-        p: dropout probability
-        training: whether in training mode
-        
-    Returns:
-        Tuple of (dropped_hyperedge_index, dropped_hyperedge_weight)
-    """
-    if not training or p == 0.0 or hyperedge_index.size(1) == 0:
-        return hyperedge_index, hyperedge_weight
-    
-    # Create dropout mask for hyperedge connections
-    num_connections = hyperedge_index.size(1)
-    keep_mask = torch.rand(num_connections, device=hyperedge_index.device) >= p
-    
-    if keep_mask.sum() == 0:  # Ensure we keep at least one connection
-        keep_mask[0] = True
-    
-    # Apply dropout mask
-    dropped_hyperedge_index = hyperedge_index[:, keep_mask]
-    
-    if hyperedge_weight is not None:
-        # For hyperedge weights, we need to handle this more carefully
-        # since multiple connections might belong to the same hyperedge
-        
-        # Get unique hyperedge IDs that remain after connection dropout
-        remaining_hyperedges = torch.unique(dropped_hyperedge_index[0])
-        
-        # Create mapping from old to new hyperedge indices
-        hyperedge_mapping = torch.zeros(hyperedge_weight.size(0), dtype=torch.long, device=hyperedge_index.device)
-        hyperedge_mapping[remaining_hyperedges] = torch.arange(len(remaining_hyperedges), device=hyperedge_index.device)
-        
-        # Update hyperedge indices in the dropped index tensor
-        dropped_hyperedge_index[0] = hyperedge_mapping[dropped_hyperedge_index[0]]
-        
-        # Keep only weights for remaining hyperedges
-        dropped_hyperedge_weight = hyperedge_weight[remaining_hyperedges]
-    else:
-        dropped_hyperedge_weight = None
-    
-    return dropped_hyperedge_index, dropped_hyperedge_weight
-
-
-def structural_hyperedge_dropout(hyperedge_index: torch.Tensor,
-                                hyperedge_weight: Optional[torch.Tensor] = None,
-                                p: float = 0.1,
-                                training: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Apply dropout at the hyperedge level (drop entire hyperedges).
-    
-    Args:
-        hyperedge_index: [2, num_connections] hyperedge connectivity
-        hyperedge_weight: optional hyperedge weights
-        p: dropout probability for entire hyperedges
-        training: whether in training mode
-        
-    Returns:
-        Tuple of (dropped_hyperedge_index, dropped_hyperedge_weight)
-    """
-    if not training or p == 0.0 or hyperedge_index.size(1) == 0:
-        return hyperedge_index, hyperedge_weight
-    
-    # Get unique hyperedge IDs
-    unique_hyperedges = torch.unique(hyperedge_index[0])
-    num_hyperedges = len(unique_hyperedges)
-    
-    # Create dropout mask for entire hyperedges
-    keep_mask = torch.rand(num_hyperedges, device=hyperedge_index.device) >= p
-    
-    if keep_mask.sum() == 0:  # Ensure we keep at least one hyperedge
-        keep_mask[0] = True
-    
-    # Get hyperedges to keep
-    kept_hyperedges = unique_hyperedges[keep_mask]
-    
-    # Create mask for connections belonging to kept hyperedges
-    connection_mask = torch.isin(hyperedge_index[0], kept_hyperedges)
-    
-    # Apply mask to connections
-    dropped_hyperedge_index = hyperedge_index[:, connection_mask]
-    
-    # Remap hyperedge indices to be contiguous
-    hyperedge_mapping = torch.zeros(hyperedge_index[0].max().item() + 1, 
-                                   dtype=torch.long, device=hyperedge_index.device)
-    hyperedge_mapping[kept_hyperedges] = torch.arange(len(kept_hyperedges), device=hyperedge_index.device)
-    dropped_hyperedge_index[0] = hyperedge_mapping[dropped_hyperedge_index[0]]
-    
-    # Handle hyperedge weights
-    if hyperedge_weight is not None:
-        dropped_hyperedge_weight = hyperedge_weight[kept_hyperedges]
-    else:
-        dropped_hyperedge_weight = None
-    
-    return dropped_hyperedge_index, dropped_hyperedge_weight
-
-def graph_to_hypergraph(edge_index: torch.Tensor, num_nodes: int, 
-                       hyperedge_type: str = "co_citation") -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Convert a regular graph to a hypergraph using different strategies.
-    
-    Args:
-        edge_index: [2, num_edges] - standard graph edges (assumed to be citation links)
-        num_nodes: number of nodes
-        hyperedge_type: "co_citation", "citation", or "edge"
-    
-    Returns:
-        hyperedge_index: [2, num_hyperedge_connections] 
-        hyperedge_weight: optional weights for hyperedges
-    """
-    
-    if hyperedge_type == "edge":
-        # Each edge becomes a hyperedge with 2 nodes
-        num_edges = edge_index.size(1)
-        hyperedge_index = torch.zeros(2, num_edges * 2, dtype=torch.long)
-        
-        for i in range(num_edges):
-            # Hyperedge i connects nodes edge_index[0, i] and edge_index[1, i]
-            hyperedge_index[0, 2*i] = i  # hyperedge id
-            hyperedge_index[1, 2*i] = edge_index[0, i]  # first node
-            hyperedge_index[0, 2*i + 1] = i  # hyperedge id
-            hyperedge_index[1, 2*i + 1] = edge_index[1, i]  # second node
-            
-        return hyperedge_index, None
-    
-    elif hyperedge_type == "co_citation":
-        # Co-citation: papers that are cited together form a hyperedge
-        # If papers A and B both cite paper C, then {A, B, C} form a hyperedge
-        
-        print("Building co-citation hypergraph...")
-        
-        # Build citation structure: cited_by[paper] = [papers that cite it]
-        cited_by = {i: [] for i in range(num_nodes)}
-        
-        # In citation networks, edge_index[0] -> edge_index[1] means edge_index[0] cites edge_index[1]
-        for i in range(edge_index.size(1)):
-            citing_paper = edge_index[0, i].item()
-            cited_paper = edge_index[1, i].item()
-            cited_by[cited_paper].append(citing_paper)
-        
-        hyperedge_connections = []
-        hyperedge_weights = []
-        hyperedge_id = 0
-        
-        for cited_paper in range(num_nodes):
-            citing_papers = cited_by[cited_paper]
-            
-            # Only create hyperedge if at least 2 papers cite this paper
-            if len(citing_papers) >= 2:
-                # Create hyperedge with the cited paper and all papers that cite it
-                hyperedge_nodes = [cited_paper] + citing_papers
-                
-                # Remove duplicates and sort
-                hyperedge_nodes = sorted(list(set(hyperedge_nodes)))
-                
-                # Add connections to hyperedge
-                for node in hyperedge_nodes:
-                    hyperedge_connections.append([hyperedge_id, node])
-                
-                # Weight based on number of co-citing papers
-                weight = len(citing_papers)
-                hyperedge_weights.append(weight)
-                hyperedge_id += 1
-        
-        if hyperedge_connections:
-            hyperedge_index = torch.tensor(hyperedge_connections, dtype=torch.long).t()
-            hyperedge_weight = torch.tensor(hyperedge_weights, dtype=torch.float)
-        else:
-            hyperedge_index = torch.zeros(2, 0, dtype=torch.long)
-            hyperedge_weight = None
-            
-        return hyperedge_index, hyperedge_weight
-    
-    elif hyperedge_type == "citation":
-        # Citation-based: each paper and all papers it cites form a hyperedge
-        # If paper A cites papers {B, C, D}, then {A, B, C, D} form a hyperedge
-        
-        print("Building citation hypergraph...")
-        
-        # Build outgoing citations: cites[paper] = [papers it cites]
-        cites = {i: [] for i in range(num_nodes)}
-        
-        for i in range(edge_index.size(1)):
-            citing_paper = edge_index[0, i].item()
-            cited_paper = edge_index[1, i].item()
-            cites[citing_paper].append(cited_paper)
-        
-        hyperedge_connections = []
-        hyperedge_weights = []
-        hyperedge_id = 0
-        
-        for citing_paper in range(num_nodes):
-            cited_papers = cites[citing_paper]
-            
-            # Only create hyperedge if this paper cites at least 1 other paper
-            if len(cited_papers) >= 1:
-                # Create hyperedge with the citing paper and all papers it cites
-                hyperedge_nodes = [citing_paper] + cited_papers
-                
-                # Remove duplicates and sort
-                hyperedge_nodes = sorted(list(set(hyperedge_nodes)))
-                
-                # Add connections to hyperedge
-                for node in hyperedge_nodes:
-                    hyperedge_connections.append([hyperedge_id, node])
-                
-                # Weight based on number of citations made
-                weight = len(cited_papers)
-                hyperedge_weights.append(weight)
-                hyperedge_id += 1
-        
-        if hyperedge_connections:
-            hyperedge_index = torch.tensor(hyperedge_connections, dtype=torch.long).t()
-            hyperedge_weight = torch.tensor(hyperedge_weights, dtype=torch.float)
-        else:
-            hyperedge_index = torch.zeros(2, 0, dtype=torch.long)
-            hyperedge_weight = None
-            
-        return hyperedge_index, hyperedge_weight
-    
-    else:
-        raise ValueError(f"Unknown hyperedge_type: {hyperedge_type}")
-
-def create_full_split(data, train_ratio=0.5, val_ratio=0.25, test_ratio=0.25):
-    """Create a more balanced split using all nodes"""
-    num_nodes = data.x.size(0)
-    indices = torch.randperm(num_nodes)
-    
-    train_end = int(train_ratio * num_nodes)
-    val_end = train_end + int(val_ratio * num_nodes)
-    
-    train_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    val_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    test_mask = torch.zeros(num_nodes, dtype=torch.bool)
-    
-    train_mask[indices[:train_end]] = True
-    val_mask[indices[train_end:val_end]] = True
-    test_mask[indices[val_end:]] = True
-    
-    return train_mask, val_mask, test_mask
-
-def create_train_only_hypergraph(edge_index, train_mask, num_nodes, hyperedge_type):
-    # Only use edges where both nodes are in training set
-    train_nodes = set(torch.where(train_mask)[0].tolist())
-    
-    train_edges = []
-    for i in range(edge_index.size(1)):
-        src, dst = edge_index[0, i].item(), edge_index[1, i].item()
-        if src in train_nodes and dst in train_nodes:
-            train_edges.append([src, dst])
-    
-    if not train_edges:
-        return torch.zeros(2, 0, dtype=torch.long), None
-    
-    train_edge_index = torch.tensor(train_edges, dtype=torch.long).t()
-    return graph_to_hypergraph(train_edge_index, num_nodes, hyperedge_type)
-
-def load_planetoid_data(dataset_name: str, root: str = "./data"):
-    """Load and preprocess Planetoid dataset"""
-    dataset = Planetoid(root=root, name=dataset_name)
-    data = dataset[0]
-    
-    print(f"Dataset: {dataset_name}")
-    print(f"Number of nodes: {data.x.size(0)}")
-    print(f"Number of edges: {data.edge_index.size(1)}")
-    print(f"Number of features: {data.x.size(1)}")
-    print(f"Number of classes: {dataset.num_classes}")
-    print(f"Training nodes: {data.train_mask.sum().item()}")
-    print(f"Validation nodes: {data.val_mask.sum().item()}")
-    print(f"Test nodes: {data.test_mask.sum().item()}")
-    
-    return data, dataset.num_classes
-
+# --------------------------
+# Training / Eval helpers
+# --------------------------
 def model_forward(model, data, hyperedge_index=None, hyperedge_weight=None, mode='hypergrand'):
     if mode == 'gcn':
-        return model(data.x, data.edge_index)  # [N, num_classes]
+        return model(data.x, data.edge_index)
     else:
-        logits, _ = model(data.x, hyperedge_index, hyperedge_weight)
+        logits = model(data.x, hyperedge_index, hyperedge_weight)
         return logits
 
 def evaluate_model(model, data, hyperedge_index, hyperedge_weight, mask, mode):
@@ -334,218 +229,174 @@ def evaluate_model(model, data, hyperedge_index, hyperedge_weight, mask, mode):
         pred = logits.argmax(dim=1)
         y_true = data.y[mask]
         acc = accuracy_score(y_true.cpu(), pred.cpu())
-        f1 = f1_score(y_true.cpu(), pred.cpu(), average='macro')
-        precision = precision_score(y_true.cpu(), pred.cpu(), average='macro')
-        recall = recall_score(y_true.cpu(), pred.cpu(), average='macro')
+        f1 = f1_score(y_true.cpu(), pred.cpu(), average='macro', zero_division=0)
+        precision = precision_score(y_true.cpu(), pred.cpu(), average='macro', zero_division=0)
+        recall = recall_score(y_true.cpu(), pred.cpu(), average='macro', zero_division=0)
     return acc, f1, precision, recall
-
 
 def train_epoch(model, data, hyperedge_index, hyperedge_weight, optimizer, criterion,
                 edge_dropout_p=0.0, edge_dropout_type="connection", mode='hypergrand'):
     model.train()
     optimizer.zero_grad()
-
     if mode == 'gcn':
         out = model_forward(model, data, None, None, mode='gcn')
     else:
-        # Apply edge dropout only for hypergraph mode
         if edge_dropout_type == "connection":
-            dropped_hyperedge_index, dropped_hyperedge_weight = hyperedge_dropout(
-                hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True
-            )
+            d_hidx, d_hw = hyperedge_dropout(hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True)
         elif edge_dropout_type == "hyperedge":
-            dropped_hyperedge_index, dropped_hyperedge_weight = structural_hyperedge_dropout(
-                hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True
-            )
+            d_hidx, d_hw = structural_hyperedge_dropout(hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True)
         else:
-            dropped_hyperedge_index, dropped_hyperedge_weight = hyperedge_index, hyperedge_weight
-
-        out = model_forward(model, data, dropped_hyperedge_index, dropped_hyperedge_weight, mode='hypergrand')
-
+            d_hidx, d_hw = hyperedge_index, hyperedge_weight
+        out = model_forward(model, data, d_hidx, d_hw, mode='hypergrand')
     loss = criterion(out[data.train_mask], data.y[data.train_mask])
     loss.backward()
     optimizer.step()
     return loss.item()
 
-
+# --------------------------
+# Main (argparse) + training loop with early stopping & scheduler
+# --------------------------
 def main():
-    parser = argparse.ArgumentParser(description='HyperGRAND on Planetoid datasets')
-    parser.add_argument('--model', type=str, default='hypergrand',
-                    choices=['hypergrand', 'gcn'], help='Which model to run')
-    parser.add_argument('--dataset', type=str, default='Cora', 
-                       choices=['Cora', 'CiteSeer', 'PubMed'],
-                       help='Dataset name')
-    parser.add_argument('--hidden_dim', type=int, default=32, help='Hidden dimension')
-    parser.add_argument('--num_layers', type=int, default=3, help='Number of layers')
-    parser.add_argument('--alpha', type=float, default=0.1, help='Diffusion alpha')
-    parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate')
-    parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay')
-    parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
-    parser.add_argument('--integration_scheme', type=str, default='explicit',
-                       choices=['explicit', 'implicit', 'multistep', 'adaptive'],
-                       help='Integration scheme')
-    parser.add_argument('--hyperedge_type', type=str, default='citation',
-                       choices=['edge', 'co_citation', 'citation'],
-                       help='How to convert graph to hypergraph')
-    parser.add_argument('--edge_dropout', type=float, default=0.5, help='Edge dropout probability')
-    parser.add_argument('--edge_dropout_type', type=str, default='connection',
-                       choices=['connection', 'hyperedge', 'none'],
-                       help='Type of edge dropout: connection-level or hyperedge-level')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--use_full_split', action='store_true', 
-                   help='Use 50/25/25 split instead of standard Planetoid split')
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', choices=['hypergrand', 'gcn', 'linear'], default='hypergrand')
+    parser.add_argument('--dataset', choices=['Cora', 'CiteSeer', 'PubMed'], default='Cora')
+    parser.add_argument('--hidden_dim', type=int, default=64)
+    parser.add_argument('--num_layers', type=int, default=3)
+    parser.add_argument('--alpha', type=float, default=0.1)
+    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--lr', type=float, default=5e-3)
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--epochs', type=int, default=300)
+    parser.add_argument('--integration_scheme', choices=['explicit','implicit','multistep','adaptive'], default='explicit')
+    parser.add_argument('--hyperedge_type', choices=['edge','co_citation','citation'], default='co_citation')
+    parser.add_argument('--edge_dropout', type=float, default=0.1)
+    parser.add_argument('--edge_dropout_type', choices=['connection','hyperedge','none'], default='connection')
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--use_full_split', action='store_true')
+    parser.add_argument('--use_full_hypergraph', action='store_true',
+                        help='Build hyperedges from full graph rather than train-only edges (recommended for encoder).')
+    parser.add_argument('--patience', type=int, default=50)
+    parser.add_argument('--save_path', type=str, default='best_hypergrand.pt')
     args = parser.parse_args()
 
-    # Set random seeds
+    # seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-    
+        torch.cuda.manual_seed_all(args.seed)
+
     device = torch.device(args.device)
-    print(f"Using device: {device}")
-    
-    # Load data
+    print("Using device:", device)
+
     data, num_classes = load_planetoid_data(args.dataset)
     data = data.to(device)
 
     if args.use_full_split:
-        print("Using full dataset split (50/25/25)...")
-        train_mask, val_mask, test_mask = create_full_split(data)
-        data.train_mask = train_mask
-        data.val_mask = val_mask  
-        data.test_mask = test_mask
-    
-    # Convert to hypergraph
-    print(f"\nConverting to hypergraph using '{args.hyperedge_type}' method...")
-    hyperedge_index, hyperedge_weight = create_train_only_hypergraph(
-        data.edge_index, data.train_mask, data.x.size(0), args.hyperedge_type
-    )
+        print("Using full split 50/25/25")
+        tr, va, te = create_full_split(data)
+        data.train_mask = tr
+        data.val_mask = va
+        data.test_mask = te
+
+    # create hypergraph (optionally full graph)
+    print(f"Converting to hypergraph using '{args.hyperedge_type}' (use_full_hypergraph={args.use_full_hypergraph})...")
+    if args.use_full_hypergraph:
+        hyperedge_index, hyperedge_weight = graph_to_hypergraph(data.edge_index, data.x.size(0), args.hyperedge_type)
+    else:
+        hyperedge_index, hyperedge_weight = create_train_only_hypergraph(data.edge_index, data.train_mask, data.x.size(0), args.hyperedge_type)
+
     hyperedge_index = hyperedge_index.to(device)
     if hyperedge_weight is not None:
         hyperedge_weight = hyperedge_weight.to(device)
-    
-    num_hyperedges = hyperedge_index[0].max().item() + 1 if hyperedge_index.size(1) > 0 else 0
+    num_hyperedges = (int(hyperedge_index[0].max().item()) + 1) if hyperedge_index.size(1) > 0 else 0
     print(f"Created {num_hyperedges} hyperedges with {hyperedge_index.size(1)} connections")
-    
-    # Create model
-    print(f"\nCreating HyperGRAND model...")
-    print(f"Integration scheme: {args.integration_scheme}")
-    print(f"Architecture: {data.x.size(1)} -> {args.hidden_dim} -> {num_classes}")
 
-    mode = None 
+    print("\nCreating model...")
+    print("Integration scheme:", args.integration_scheme)
+    print("Architecture:", f"{data.x.size(1)} -> {args.hidden_dim} -> {num_classes}")
 
-
+    mode = None
     if args.model == 'gcn':
-        print("Running SimpleGCN baseline")
-        model = SimpleGCN(input_dim=data.x.size(1),
-                        hidden_dim=args.hidden_dim,
-                        output_dim=num_classes,
-                        dropout=args.dropout).to(device)
+        model = SimpleGCN(input_dim=data.x.size(1), hidden_dim=args.hidden_dim, output_dim=num_classes, dropout=args.dropout).to(device)
         mode = 'gcn'
-    else:
-        print("Running HyperGRAND")
-        encoder = create_hypergrand_model(
-            input_dim=data.x.size(1),
-            hidden_dim=args.hidden_dim,
-            scheme=args.integration_scheme,
-            num_layers=args.num_layers,
-            alpha=args.alpha,
-            dropout=args.dropout
-        )
-        model = HypergraphClassifier(encoder, num_classes).to(device)
+    elif args.model == 'linear':
+        # trivial baseline
+        from types import SimpleNamespace
+        class LinEnc(nn.Module):
+            def __init__(self, in_dim, h):
+                super().__init__()
+                self.input_transform = nn.Linear(in_dim, h)
+                self.hidden_dim = h
+                self.input_dim = in_dim
+            def forward(self, x, *args, **kwargs):
+                return F.relu(self.input_transform(x))
+        enc = LinEnc(data.x.size(1), args.hidden_dim).to(device)
+        model = HypergraphClassifier(enc, num_classes, dropout=args.dropout).to(device)
         mode = 'hypergrand'
- 
-    # Print model info
+    else:
+        enc = create_hypergrand_model(input_dim=data.x.size(1),
+                                      hidden_dim=args.hidden_dim,
+                                      scheme=args.integration_scheme,
+                                      num_layers=args.num_layers,
+                                      alpha=args.alpha,
+                                      dropout=args.dropout).to(device)
+        model = HypergraphClassifier(enc, num_classes, dropout=args.dropout).to(device)
+        mode = 'hypergrand'
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    
-    # Setup training
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    criterion = nn.CrossEntropyLoss()
-    
-    print(f"\n{'='*80}")
-    print(f"TRAINING HYPERPARAMETERS")
-    print(f"{'='*80}")
-    print(f"Dataset: {args.dataset}")
-    print(f"Integration scheme: {args.integration_scheme}")
-    print(f"Hyperedge type: {args.hyperedge_type}")
-    print(f"Hidden dimension: {args.hidden_dim}")
-    print(f"Number of layers: {args.num_layers}")
-    print(f"Alpha (diffusion): {args.alpha}")
-    print(f"Dropout: {args.dropout}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Weight decay: {args.weight_decay}")
-    print(f"Edge dropout: {args.edge_dropout}")
-    print(f"Edge dropout type: {args.edge_dropout_type}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Device: {device}")
-    print(f"Seed: {args.seed}")
-    print(f"{'='*80}")
-    
-    # Training loop
-    best_val_acc = 0
-    best_test_acc = 0
-    start_time = time.time()
-    
-    print(f"\n{'Epoch':<6} {'Loss':<8} {'Train Acc':<10} {'Train F1':<10} {'Val Acc':<10} {'Val F1':<10} {'Test Acc':<10} {'Test F1':<10} {'Time':<8}")
-    print(f"{'-'*90}")
-    
-    for epoch in range(args.epochs):
-        epoch_start = time.time()
-        
-        # Train
-        train_loss = train_epoch(model, data, hyperedge_index, hyperedge_weight, optimizer, criterion, 
-                               args.edge_dropout, args.edge_dropout_type, mode=mode)
-        
-        # Evaluate (no dropout during evaluation)
-        train_acc, train_f1, train_prec, train_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask, mode=mode)
-        val_acc, val_f1, val_prec, val_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask, mode=mode)
-        test_acc, test_f1, test_prec, test_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask, mode=mode)
-        
-        epoch_time = time.time() - epoch_start
-        
-        # Track best performance
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_test_acc = test_acc
-        
-        # Print epoch results
-        print(f"{epoch+1:<6} {train_loss:<8.4f} {train_acc:<10.4f} {train_f1:<10.4f} "
-              f"{val_acc:<10.4f} {val_f1:<10.4f} {test_acc:<10.4f} {test_f1:<10.4f} {epoch_time:<8.2f}s")
-        
-        # Detailed metrics every 50 epochs
-        if (epoch + 1) % 50 == 0:
-            print(f"    Detailed metrics at epoch {epoch+1}:")
-            print(f"    Train - Acc: {train_acc:.4f}, F1: {train_f1:.4f}, Prec: {train_prec:.4f}, Rec: {train_rec:.4f}")
-            print(f"    Val   - Acc: {val_acc:.4f}, F1: {val_f1:.4f}, Prec: {val_prec:.4f}, Rec: {val_rec:.4f}")
-            print(f"    Test  - Acc: {test_acc:.4f}, F1: {test_f1:.4f}, Prec: {test_prec:.4f}, Rec: {test_rec:.4f}")
-    
-    total_time = time.time() - start_time
-    
-    print(f"\n{'='*80}")
-    print(f"FINAL RESULTS")
-    print(f"{'='*80}")
-    print(f"Best validation accuracy: {best_val_acc:.4f}")
-    print(f"Test accuracy at best val: {best_test_acc:.4f}")
-    print(f"Total training time: {total_time:.2f}s")
-    print(f"Average time per epoch: {total_time/args.epochs:.2f}s")
-    
-    # Final detailed evaluation
-    print(f"\nFinal detailed evaluation:")
-    final_train_acc, final_train_f1, final_train_prec, final_train_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask, mode=mode)
-    final_val_acc, final_val_f1, final_val_prec, final_val_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask, mode=mode)
-    final_test_acc, final_test_f1, final_test_prec, final_test_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask, mode=mode)
-    
-    print(f"Final Train - Acc: {final_train_acc:.4f}, F1: {final_train_f1:.4f}, Prec: {final_train_prec:.4f}, Rec: {final_train_rec:.4f}")
-    print(f"Final Val   - Acc: {final_val_acc:.4f}, F1: {final_val_f1:.4f}, Prec: {final_val_prec:.4f}, Rec: {final_val_rec:.4f}")
-    print(f"Final Test  - Acc: {final_test_acc:.4f}, F1: {final_test_f1:.4f}, Prec: {final_test_prec:.4f}, Rec: {final_test_rec:.4f}")
+    print(f"Total params: {total_params:,}, Trainable: {trainable_params:,}")
 
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
+    criterion = nn.CrossEntropyLoss()
+
+    best_val = 0.0
+    best_test = 0.0
+    best_epoch = 0
+    start_time = time.time()
+    bad_epochs = 0
+
+    print("\n{:<6} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {:<10} {:<8}".format(
+        'Epoch','Loss','TrainAcc','TrainF1','ValAcc','ValF1','TestAcc','TestF1','Time'
+    ))
+    for epoch in range(1, args.epochs + 1):
+        epoch_start = time.time()
+        loss = train_epoch(model, data, hyperedge_index, hyperedge_weight, optimizer, criterion,
+                           edge_dropout_p=args.edge_dropout, edge_dropout_type=args.edge_dropout_type, mode=mode)
+        train_acc, train_f1, _, _ = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask, mode=mode)
+        val_acc, val_f1, _, _ = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask, mode=mode)
+        test_acc, test_f1, _, _ = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask, mode=mode)
+        epoch_time = time.time() - epoch_start
+
+        # scheduler step on val
+        scheduler.step(val_acc)
+
+        if val_acc > best_val + 1e-6:
+            best_val = val_acc
+            best_test = test_acc
+            best_epoch = epoch
+            bad_epochs = 0
+            torch.save({'model_state': model.state_dict(),
+                        'optimizer_state': optimizer.state_dict(),
+                        'epoch': epoch,
+                        'val_acc': val_acc,
+                        'test_acc': test_acc}, args.save_path)
+        else:
+            bad_epochs += 1
+
+        print(f"{epoch:<6} {loss:<8.4f} {train_acc:<10.4f} {train_f1:<10.4f} {val_acc:<10.4f} {val_f1:<10.4f} {test_acc:<10.4f} {test_f1:<10.4f} {epoch_time:<8.2f}s")
+
+        if bad_epochs >= args.patience:
+            print(f"Early stopping triggered after {bad_epochs} bad epochs. Best val {best_val:.4f} at epoch {best_epoch}.")
+            break
+
+    total_time = time.time() - start_time
+    print("Training finished. Best val acc:", best_val, "Test at best val:", best_test)
+    print("Saved best model to", args.save_path)
+    print("Total time: %.2fs | Avg/epoch: %.2fs" % (total_time, total_time / max(1, epoch)))
 
 if __name__ == "__main__":
     main()
+

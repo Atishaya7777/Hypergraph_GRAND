@@ -12,7 +12,7 @@ class IntegrationScheme(Enum):
     MULTISTEP = "multistep" 
     ADAPTIVE = "adaptive"
 
-
+# ----------------- Integrators -----------------
 class BaseIntegrator(ABC):
     """Base class for numerical integration schemes"""
     
@@ -20,20 +20,16 @@ class BaseIntegrator(ABC):
         self.alpha = alpha
     
     @abstractmethod
-    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, 
-             diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
+    def step(self, h_current: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
         """Perform one integration step"""
         pass
 
-
 class ExplicitEulerIntegrator(BaseIntegrator):
-    """Explicit Euler integration: h_{t+1} = h_0 + α * f(h_t)"""
+    """Explicit Euler integration: h_{t+1} = h_t + α * f(h_t)"""
     
-    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, 
-             diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
+    def step(self, h_current: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
         divergence = diffusion_fn(h_current, *args, **kwargs)
-        return h_init + self.alpha * divergence
-
+        return h_current + self.alpha * divergence
 
 class ImplicitEulerIntegrator(BaseIntegrator):
     """Implicit Euler with fixed-point iteration (practical version)."""
@@ -42,43 +38,31 @@ class ImplicitEulerIntegrator(BaseIntegrator):
         super().__init__(alpha)
         self.max_iter = max_iter
         self.tol = tol
-        self.relaxation = relaxation  # 1.0 = full update; <1.0 = under-relaxation
+        self.relaxation = relaxation
         self.verbose = verbose
 
-    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
-        """
-        Do fixed-point iteration in torch.no_grad() to avoid building an enormous graph.
-        After convergence, compute one final differentiable evaluation (small graph).
-        """
+    def step(self, h_current: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
         device = h_current.device
-        # Start from a detached iterate to avoid graph building across iterations
         h_new = h_current.detach().clone().to(device)
 
         converged = False
         for it in range(self.max_iter):
             h_prev = h_new
-            # iteration done without tracking grads
             with torch.no_grad():
-                divergence = diffusion_fn(h_new, *args, **kwargs)   # heavy, but no graph
-                candidate = h_init + self.alpha * divergence
-                # relaxation to improve stability
+                divergence = diffusion_fn(h_new, *args, **kwargs)
+                candidate = h_new + self.alpha * divergence
                 h_new = h_prev + self.relaxation * (candidate - h_prev)
-
-            # check convergence (use 2-norm)
-            diff_norm = torch.norm(h_new - h_prev)
-            if diff_norm < self.tol:
+            if torch.norm(h_new - h_prev) < self.tol:
                 converged = True
                 break
 
         if not converged and self.verbose:
-            print(f"[ImplicitIntegrator] fixed-point did NOT converge (iter={it+1}/{self.max_iter}) final_norm={diff_norm:.4e}")
+            print(f"[ImplicitIntegrator] fixed-point did NOT converge (iter={it+1}/{self.max_iter}) final_norm={torch.norm(h_new - h_prev):.4e}")
 
-        # final differentiable evaluation: create a fresh tensor that requires grad
-        # and evaluate diffusion_fn once to create a small graph for backward.
+        # final differentiable evaluation
         h_final = h_new.clone().detach().requires_grad_(True)
         divergence_final = diffusion_fn(h_final, *args, **kwargs)
-        return h_init + self.alpha * divergence_final
-
+        return h_current + self.alpha * divergence_final
 
 class MultistepIntegrator(BaseIntegrator):
     """Adams-Bashforth 2-step method"""
@@ -87,24 +71,17 @@ class MultistepIntegrator(BaseIntegrator):
         super().__init__(alpha)
         self.prev_divergence = None
     
-    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, 
-             diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
+    def step(self, h_current: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
         current_divergence = diffusion_fn(h_current, *args, **kwargs)
-        
         if self.prev_divergence is None:
-            # First step: use explicit Euler
-            h_new = h_init + self.alpha * current_divergence
+            h_new = h_current + self.alpha * current_divergence
         else:
-            # Adams-Bashforth 2-step: h_{t+1} = h_0 + α * (1.5 * f_t - 0.5 * f_{t-1})
-            h_new = h_init + self.alpha * (1.5 * current_divergence - 0.5 * self.prev_divergence)
-        
+            h_new = h_current + self.alpha * (1.5 * current_divergence - 0.5 * self.prev_divergence)
         self.prev_divergence = current_divergence.clone()
         return h_new
     
     def reset(self):
-        """Reset the integrator state"""
         self.prev_divergence = None
-
 
 class AdaptiveIntegrator(BaseIntegrator):
     """Adaptive step size using RK45 with error estimation"""
@@ -117,42 +94,29 @@ class AdaptiveIntegrator(BaseIntegrator):
         self.tol = tol
         self.current_alpha = alpha
     
-    def step(self, h_current: torch.Tensor, h_init: torch.Tensor, 
-             diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
-        # Runge-Kutta 4th order with embedded 5th order for error estimation
+    def step(self, h_current: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
         k1 = diffusion_fn(h_current, *args, **kwargs)
-        k2 = diffusion_fn(h_init + self.current_alpha * 0.25 * k1, *args, **kwargs)
-        k3 = diffusion_fn(h_init + self.current_alpha * (3/32 * k1 + 9/32 * k2), *args, **kwargs)
-        k4 = diffusion_fn(h_init + self.current_alpha * (1932/2197 * k1 - 7200/2197 * k2 + 7296/2197 * k3), *args, **kwargs)
-        k5 = diffusion_fn(h_init + self.current_alpha * (439/216 * k1 - 8 * k2 + 3680/513 * k3 - 845/4104 * k4), *args, **kwargs)
-        k6 = diffusion_fn(h_init + self.current_alpha * (-8/27 * k1 + 2 * k2 - 3544/2565 * k3 + 1859/4104 * k4 - 11/40 * k5), *args, **kwargs)
+        k2 = diffusion_fn(h_current + self.current_alpha * 0.25 * k1, *args, **kwargs)
+        k3 = diffusion_fn(h_current + self.current_alpha * (3/32 * k1 + 9/32 * k2), *args, **kwargs)
+        k4 = diffusion_fn(h_current + self.current_alpha * (1932/2197 * k1 - 7200/2197 * k2 + 7296/2197 * k3), *args, **kwargs)
+        k5 = diffusion_fn(h_current + self.current_alpha * (439/216 * k1 - 8 * k2 + 3680/513 * k3 - 845/4104 * k4), *args, **kwargs)
+        k6 = diffusion_fn(h_current + self.current_alpha * (-8/27 * k1 + 2 * k2 - 3544/2565 * k3 + 1859/4104 * k4 - 11/40 * k5), *args, **kwargs)
         
-        # 4th order solution
-        h_4th = h_init + self.current_alpha * (25/216 * k1 + 1408/2565 * k3 + 2197/4104 * k4 - 1/5 * k5)
+        h_4th = h_current + self.current_alpha * (25/216 * k1 + 1408/2565 * k3 + 2197/4104 * k4 - 1/5 * k5)
+        h_5th = h_current + self.current_alpha * (16/135 * k1 + 6656/12825 * k3 + 28561/56430 * k4 - 9/50 * k5 + 2/55 * k6)
         
-        # 5th order solution
-        h_5th = h_init + self.current_alpha * (16/135 * k1 + 6656/12825 * k3 + 28561/56430 * k4 - 9/50 * k5 + 2/55 * k6)
-        
-        # Estimate error
         error = torch.norm(h_5th - h_4th)
         
-        # Adapt step size
         if error < self.tol:
-            # Accept step and possibly increase step size
             self.current_alpha = min(self.max_alpha, self.current_alpha * 1.2)
             return h_4th
         else:
-            # Reject step and decrease step size
             self.current_alpha = max(self.min_alpha, self.current_alpha * 0.5)
-            # Retry with smaller step
-            return self.step(h_current, h_init, diffusion_fn, *args, **kwargs)
+            return self.step(h_current, diffusion_fn, *args, **kwargs)
 
-
+# ----------------- Hypergraph Diffusion Layer -----------------
 class HypergraphDiffusionLayer(nn.Module):
-    """
-    Single diffusion layer for hypergraphs implementing the diffusion equation.
-    Fixes: attention normalization, avoids tensor allocations in loops.
-    """
+    """Single hypergraph diffusion layer"""
     def __init__(self, hidden_dim: int, alpha: float = 0.1, dropout: float = 0.1,
                  integration_scheme: IntegrationScheme = IntegrationScheme.EXPLICIT,
                  integrator_kwargs: Optional[dict] = None):
@@ -160,7 +124,6 @@ class HypergraphDiffusionLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.alpha = alpha
         self.dropout = dropout
-
         self.W_K = nn.Linear(hidden_dim, hidden_dim)
         self.W_Q = nn.Linear(hidden_dim, hidden_dim)
         self.layer_norm = nn.LayerNorm(hidden_dim)
@@ -180,154 +143,94 @@ class HypergraphDiffusionLayer(nn.Module):
         else:
             raise ValueError(f"Unknown integration scheme: {scheme}")
 
-    def forward(self, h, h_init, hyperedge_index, hyperedge_weight=None, membership=None):
-            """Apply one step of hypergraph diffusion"""
+    def forward(self, h, hyperedge_index, hyperedge_weight=None, membership=None):
+        device = h.device
+        hyperedges = self.get_hyperedge_structure(hyperedge_index)
+        degrees = self.compute_node_degrees(hyperedge_index, h.size(0))
 
-            device = h.device
-            # precompute hyperedge structure and degrees once (avoid rebuilding inside integrator loops)
-            hyperedges = self.get_hyperedge_structure(hyperedge_index)
-            degrees = self.compute_node_degrees(hyperedge_index, h.size(0))
+        def diffusion_fn(h_input):
+            return self._compute_diffusion_step(h_input, hyperedges, degrees, hyperedge_weight, membership)
 
-            def diffusion_function(h_input):
-                # note: pass precomputed hyperedges & degrees to avoid recomputing per iteration
-                return self._compute_diffusion_step(h_input, hyperedges, degrees, hyperedge_weight, membership)
-
-            # Run integrator step (this may perform several iterations for implicit integrator)
-            h_new = self.integrator.step(h, h_init, diffusion_function)
-
-            # Normalize + dropout
-            h_new = self.layer_norm(h_new)
-            h_new = F.dropout(h_new, p=self.dropout, training=self.training)
-
-            return h_new
-
-    def _compute_diffusion_step(self, h, hyperedges, degrees, hyperedge_weight=None, membership=None):
-        """Compute the divergence using precomputed hyperedges and degrees"""
-        num_nodes = h.size(0)
-
-        # If no hyperedges, return zero divergence
-        if len(hyperedges) == 0:
-            return torch.zeros_like(h)
-
-        # reuse your existing methods that accept hyperedges, degrees
-        grad = self.compute_hypergraph_gradient(h, hyperedges, degrees, hyperedge_weight, membership)
-        G = self.compute_diffusion_tensor(h, hyperedges, membership)
-        divergence = self.compute_divergence(grad, G, hyperedges, degrees, hyperedge_weight, membership, num_nodes)
-        return divergence
+        h_new = self.integrator.step(h, diffusion_fn)
+        h_new = self.layer_norm(h_new)
+        h_new = F.dropout(h_new, p=self.dropout, training=self.training)
+        return h_new
 
     def reset_integrator(self):
         if hasattr(self.integrator, 'reset'):
             self.integrator.reset()
 
+    # --------------- Helper methods ----------------
+    def _compute_diffusion_step(self, h, hyperedges, degrees, hyperedge_weight=None, membership=None):
+        if len(hyperedges) == 0:
+            return torch.zeros_like(h)
+        grad = self.compute_hypergraph_gradient(h, hyperedges, degrees, hyperedge_weight, membership)
+        G = self.compute_diffusion_tensor(h, hyperedges, membership)
+        divergence = self.compute_divergence(grad, G, hyperedges, degrees, hyperedge_weight, membership, h.size(0))
+        return divergence
+
     def compute_hypergraph_gradient(self, psi, hyperedges, degrees, hyperedge_weight=None, membership=None):
-        """Compute hypergraph gradient operator (per-hyperedge vector)."""
         device = psi.device
+        deg_eps = degrees + 1e-8
         grads = []
-        deg_eps = degrees + 1e-8  # [num_nodes]
-        for e_idx, nodes_in_edge in enumerate(hyperedges):
-            m = len(nodes_in_edge)
+        for e_idx, nodes in enumerate(hyperedges):
+            m = len(nodes)
             if m < 2:
                 grads.append(torch.zeros(self.hidden_dim, device=device))
                 continue
-
             edge_w = 1.0 if hyperedge_weight is None else float(hyperedge_weight[e_idx].item())
-            delta_e = m
-
-            ref_node = nodes_in_edge[0]
-            mu_ref = 1.0 if membership is None else float(membership[e_idx, ref_node].item())
-            # compute ref term once
-            ref_term = (psi[ref_node] * mu_ref) / torch.sqrt(deg_eps[ref_node])
-
-            grad_sum = torch.zeros(self.hidden_dim, device=device)
-            for node in nodes_in_edge[1:]:
-                mu_node = 1.0 if membership is None else float(membership[e_idx, node].item())
-                node_term = (psi[node] * mu_node) / torch.sqrt(deg_eps[node])
-                grad_sum += (node_term - ref_term)
-
-            scale = math.sqrt(edge_w) / math.sqrt(float(delta_e - 1))
-            grads.append(scale * grad_sum)
-        return torch.stack(grads, dim=0)  # [num_hyperedges, hidden_dim]
+            mu_vals = [1.0] * m if membership is None else [float(membership[e_idx, n].item()) for n in nodes]
+            scaled_feats = torch.stack([(psi[n] * mu_vals[idx]) / torch.sqrt(deg_eps[n]) for idx, n in enumerate(nodes)], dim=0)
+            mean_scaled = scaled_feats.mean(dim=0)
+            grad_e = (scaled_feats - mean_scaled).sum(dim=0)
+            grads.append(math.sqrt(edge_w)/math.sqrt(float(m)) * grad_e)
+        return torch.stack(grads, dim=0)
 
     def compute_diffusion_tensor(self, psi, hyperedges, membership=None):
-        """
-        Compute attention-based diffusion scalar per hyperedge.
-        Normalizes attention by sqrt(d_k) and applies softmax over pair interactions to stabilize scale.
-        """
         device = psi.device
         G_list = []
         d_k = float(self.hidden_dim)
         scale = 1.0 / math.sqrt(d_k)
-
-        for e_idx, nodes_in_edge in enumerate(hyperedges):
-            m = len(nodes_in_edge)
+        for e_idx, nodes in enumerate(hyperedges):
+            m = len(nodes)
             if m < 2:
                 G_list.append(torch.tensor(1.0, device=device))
                 continue
-
-            # stack keys/queries -> [m, hidden_dim]
-            keys = torch.stack([self.W_K(psi[v]) for v in nodes_in_edge], dim=0)  # [m, d]
-            queries = torch.stack([self.W_Q(psi[v]) for v in nodes_in_edge], dim=0)  # [m, d]
-
-            # attention matrix: [m, m] = keys @ queries.T
-            # scale and zero diagonal
+            keys = torch.stack([self.W_K(psi[v]) for v in nodes], dim=0)
+            queries = torch.stack([self.W_Q(psi[v]) for v in nodes], dim=0)
             attn = (keys @ queries.t()) * scale
-            attn = attn - torch.diag(torch.diag(attn))  # zero-out diagonal
-
-            # flatten pairwise scores then softmax to get stable normalized pair importance
-            # we compute pairwise contributions per node by summing over columns after softmax
-            # but to stabilize magnitudes we normalize with softmax over the matrix rows
-            attn_row_soft = F.softmax(attn, dim=1)  # each row sums to 1
-            # per-hyperedge scalar: average of row sums (should be 1, but weighted by interactions)
-            # better: sum of off-diagonal attention magnitudes divided by number of pair interactions
+            attn = attn - torch.diag(torch.diag(attn))
+            attn_row_soft = F.softmax(attn, dim=1)
             pairwise_sum = attn_row_soft.sum()
             G_val = torch.clamp(pairwise_sum / float(m), min=1e-8)
             G_list.append(G_val)
-
-        return torch.stack(G_list, dim=0)  # [num_hyperedges]
+        return torch.stack(G_list, dim=0)
 
     def compute_divergence(self, grad, G, hyperedges, degrees, hyperedge_weight=None, membership=None, num_nodes=None):
-        """
-        Distribute hyperedge contributions back to nodes to compute node-level divergence.
-        Vectorized-ish but loops per hyperedge; avoids creating CPU tensors in loops.
-        """
         device = grad.device
-        divergence = torch.zeros(num_nodes, self.hidden_dim, device=device)
         deg_eps = degrees + 1e-8
-
-        for e_idx, nodes_in_edge in enumerate(hyperedges):
-            m = len(nodes_in_edge)
+        divergence = torch.zeros(num_nodes, self.hidden_dim, device=device)
+        for e_idx, nodes in enumerate(hyperedges):
+            m = len(nodes)
             if m == 0:
                 continue
-
             edge_w = 1.0 if hyperedge_weight is None else float(hyperedge_weight[e_idx].item())
-            mu_vals = None
-            if membership is None:
-                mu_vals = [1.0] * m
-            else:
-                mu_vals = [float(membership[e_idx, n].item()) for n in nodes_in_edge]
-
-            # precompute constants
             sqrt_edge_w = math.sqrt(edge_w)
-            denom = max(1.0, (m - 1) * float(deg_eps[nodes_in_edge[0]].item()))
-            norm_term = math.sqrt(denom)
-
-            # grad[e_idx]: [hidden_dim], G[e_idx]: scalar
-            g_e = grad[e_idx]  # vector
+            mu_vals = [1.0]*m if membership is None else [float(membership[e_idx, n].item()) for n in nodes]
+            g_e = grad[e_idx]
             G_e = float(G[e_idx].item())
-
-            for idx, node in enumerate(nodes_in_edge):
+            for idx, node in enumerate(nodes):
+                node_deg = float(deg_eps[node].item())
+                denom = max(1.0, (m - 1) * node_deg)
+                norm_term = math.sqrt(denom)
                 mu_node = mu_vals[idx]
-                # compute contribution
                 contrib = (sqrt_edge_w * mu_node / norm_term) * (G_e * g_e)
                 divergence[node] += contrib
-
         return divergence
 
     def get_hyperedge_structure(self, hyperedge_index):
-        """Convert hyperedge_index to list of node sets for each hyperedge"""
         if hyperedge_index.size(1) == 0:
             return []
-
         num_hyperedges = int(hyperedge_index[0].max().item()) + 1
         hyperedges = [[] for _ in range(num_hyperedges)]
         for i in range(hyperedge_index.size(1)):
@@ -337,13 +240,11 @@ class HypergraphDiffusionLayer(nn.Module):
         return hyperedges
 
     def compute_node_degrees(self, hyperedge_index, num_nodes):
-        """Compute node degrees in hypergraph (vectorized)"""
         device = hyperedge_index.device
         degrees = torch.zeros(num_nodes, device=device)
         if hyperedge_index.size(1) == 0:
             return degrees
-        nodes = hyperedge_index[1]  # [num_connections]
-        # nodes might be long tensor, use scatter_add
+        nodes = hyperedge_index[1]
         ones = torch.ones_like(nodes, dtype=degrees.dtype, device=device)
         degrees = degrees.scatter_add(0, nodes, ones)
         return degrees

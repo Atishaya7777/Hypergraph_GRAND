@@ -63,7 +63,7 @@ class HypergraphGRAND(nn.Module):
             layer.reset_integrator()
         
         for layer in self.diffusion_layers:
-            h = layer(h, h_init, hyperedge_index, hyperedge_weight, membership)
+            h = layer(h, hyperedge_index, hyperedge_weight, membership)
         
         # Return latent representations
         return h
