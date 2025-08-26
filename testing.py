@@ -8,10 +8,35 @@ import time
 from typing import Tuple, Optional
 import argparse
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from torch_geometric.nn import GCNConv
 
 # Import your model
 from models.hypergrand import HypergraphGRAND, create_hypergrand_model
 from models.layers import IntegrationScheme
+
+class HypergraphClassifier(nn.Module):
+    def __init__(self, encoder: HypergraphGRAND, num_classes: int):
+        super().__init__()
+        self.encoder = encoder
+        self.classifier = nn.Linear(encoder.hidden_dim, num_classes)  # task head
+
+    def forward(self, x, hyperedge_index, hyperedge_weight=None, membership=None):
+        h = self.encoder(x, hyperedge_index, hyperedge_weight, membership)  # [N, hidden_dim]
+        logits = self.classifier(h)  # [N, num_classes]
+        return logits, h  # return both for flexibility
+
+# This should get 80-85% on Cora with full split
+class SimpleGCN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.5):
+        super().__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, output_dim)
+        self.dropout = dropout
+    
+    def forward(self, x, edge_index):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return self.conv2(x, edge_index)
 
 
 def hyperedge_dropout(hyperedge_index: torch.Tensor, 
@@ -262,6 +287,21 @@ def create_full_split(data, train_ratio=0.5, val_ratio=0.25, test_ratio=0.25):
     
     return train_mask, val_mask, test_mask
 
+def create_train_only_hypergraph(edge_index, train_mask, num_nodes, hyperedge_type):
+    # Only use edges where both nodes are in training set
+    train_nodes = set(torch.where(train_mask)[0].tolist())
+    
+    train_edges = []
+    for i in range(edge_index.size(1)):
+        src, dst = edge_index[0, i].item(), edge_index[1, i].item()
+        if src in train_nodes and dst in train_nodes:
+            train_edges.append([src, dst])
+    
+    if not train_edges:
+        return torch.zeros(2, 0, dtype=torch.long), None
+    
+    train_edge_index = torch.tensor(train_edges, dtype=torch.long).t()
+    return graph_to_hypergraph(train_edge_index, num_nodes, hyperedge_type)
 
 def load_planetoid_data(dataset_name: str, root: str = "./data"):
     """Load and preprocess Planetoid dataset"""
@@ -279,51 +319,59 @@ def load_planetoid_data(dataset_name: str, root: str = "./data"):
     
     return data, dataset.num_classes
 
+def model_forward(model, data, hyperedge_index=None, hyperedge_weight=None, mode='hypergrand'):
+    if mode == 'gcn':
+        return model(data.x, data.edge_index)  # [N, num_classes]
+    else:
+        logits, _ = model(data.x, hyperedge_index, hyperedge_weight)
+        return logits
 
-def evaluate_model(model, data, hyperedge_index, hyperedge_weight, mask):
-    """Evaluate model performance"""
+def evaluate_model(model, data, hyperedge_index, hyperedge_weight, mask, mode):
     model.eval()
     with torch.no_grad():
-        out = model(data.x, hyperedge_index, hyperedge_weight)
+        out = model_forward(model, data, hyperedge_index, hyperedge_weight, mode)
         logits = out[mask]
         pred = logits.argmax(dim=1)
         y_true = data.y[mask]
-        
         acc = accuracy_score(y_true.cpu(), pred.cpu())
         f1 = f1_score(y_true.cpu(), pred.cpu(), average='macro')
         precision = precision_score(y_true.cpu(), pred.cpu(), average='macro')
         recall = recall_score(y_true.cpu(), pred.cpu(), average='macro')
-        
-        return acc, f1, precision, recall
+    return acc, f1, precision, recall
 
 
-def train_epoch(model, data, hyperedge_index, hyperedge_weight, optimizer, criterion, edge_dropout_p=0.0, edge_dropout_type="connection"):
-    """Train for one epoch with edge dropout"""
+def train_epoch(model, data, hyperedge_index, hyperedge_weight, optimizer, criterion,
+                edge_dropout_p=0.0, edge_dropout_type="connection", mode='hypergrand'):
     model.train()
     optimizer.zero_grad()
-    
-    # Apply edge dropout during training
-    if edge_dropout_type == "connection":
-        dropped_hyperedge_index, dropped_hyperedge_weight = hyperedge_dropout(
-            hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True
-        )
-    elif edge_dropout_type == "hyperedge":
-        dropped_hyperedge_index, dropped_hyperedge_weight = structural_hyperedge_dropout(
-            hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True
-        )
+
+    if mode == 'gcn':
+        out = model_forward(model, data, None, None, mode='gcn')
     else:
-        dropped_hyperedge_index, dropped_hyperedge_weight = hyperedge_index, hyperedge_weight
-    
-    out = model(data.x, dropped_hyperedge_index, dropped_hyperedge_weight)
+        # Apply edge dropout only for hypergraph mode
+        if edge_dropout_type == "connection":
+            dropped_hyperedge_index, dropped_hyperedge_weight = hyperedge_dropout(
+                hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True
+            )
+        elif edge_dropout_type == "hyperedge":
+            dropped_hyperedge_index, dropped_hyperedge_weight = structural_hyperedge_dropout(
+                hyperedge_index, hyperedge_weight, p=edge_dropout_p, training=True
+            )
+        else:
+            dropped_hyperedge_index, dropped_hyperedge_weight = hyperedge_index, hyperedge_weight
+
+        out = model_forward(model, data, dropped_hyperedge_index, dropped_hyperedge_weight, mode='hypergrand')
+
     loss = criterion(out[data.train_mask], data.y[data.train_mask])
     loss.backward()
     optimizer.step()
-    
     return loss.item()
 
 
 def main():
     parser = argparse.ArgumentParser(description='HyperGRAND on Planetoid datasets')
+    parser.add_argument('--model', type=str, default='hypergrand',
+                    choices=['hypergrand', 'gcn'], help='Which model to run')
     parser.add_argument('--dataset', type=str, default='Cora', 
                        choices=['Cora', 'CiteSeer', 'PubMed'],
                        help='Dataset name')
@@ -373,8 +421,8 @@ def main():
     
     # Convert to hypergraph
     print(f"\nConverting to hypergraph using '{args.hyperedge_type}' method...")
-    hyperedge_index, hyperedge_weight = graph_to_hypergraph(
-        data.edge_index, data.x.size(0), args.hyperedge_type
+    hyperedge_index, hyperedge_weight = create_train_only_hypergraph(
+        data.edge_index, data.train_mask, data.x.size(0), args.hyperedge_type
     )
     hyperedge_index = hyperedge_index.to(device)
     if hyperedge_weight is not None:
@@ -387,26 +435,30 @@ def main():
     print(f"\nCreating HyperGRAND model...")
     print(f"Integration scheme: {args.integration_scheme}")
     print(f"Architecture: {data.x.size(1)} -> {args.hidden_dim} -> {num_classes}")
-    
-    model = create_hypergrand_model(
-        input_dim=data.x.size(1),
-        hidden_dim=args.hidden_dim,
-        scheme=args.integration_scheme,
-        num_layers=args.num_layers,
-        alpha=args.alpha,
-        dropout=args.dropout
-    ).to(device)
-    
-    # Add output layer for classification
-    model.classifier = nn.Linear(args.hidden_dim, num_classes).to(device)
-    
-    # Update forward method to include classification
-    original_forward = model.forward
-    def new_forward(x, hyperedge_index, hyperedge_weight=None, membership=None):
-        h = original_forward(x, hyperedge_index, hyperedge_weight, membership)
-        return model.classifier(h)
-    model.forward = new_forward
-    
+
+    mode = None 
+
+
+    if args.model == 'gcn':
+        print("Running SimpleGCN baseline")
+        model = SimpleGCN(input_dim=data.x.size(1),
+                        hidden_dim=args.hidden_dim,
+                        output_dim=num_classes,
+                        dropout=args.dropout).to(device)
+        mode = 'gcn'
+    else:
+        print("Running HyperGRAND")
+        encoder = create_hypergrand_model(
+            input_dim=data.x.size(1),
+            hidden_dim=args.hidden_dim,
+            scheme=args.integration_scheme,
+            num_layers=args.num_layers,
+            alpha=args.alpha,
+            dropout=args.dropout
+        )
+        model = HypergraphClassifier(encoder, num_classes).to(device)
+        mode = 'hypergrand'
+ 
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -449,12 +501,12 @@ def main():
         
         # Train
         train_loss = train_epoch(model, data, hyperedge_index, hyperedge_weight, optimizer, criterion, 
-                               args.edge_dropout, args.edge_dropout_type)
+                               args.edge_dropout, args.edge_dropout_type, mode=mode)
         
         # Evaluate (no dropout during evaluation)
-        train_acc, train_f1, train_prec, train_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask)
-        val_acc, val_f1, val_prec, val_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask)
-        test_acc, test_f1, test_prec, test_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask)
+        train_acc, train_f1, train_prec, train_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask, mode=mode)
+        val_acc, val_f1, val_prec, val_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask, mode=mode)
+        test_acc, test_f1, test_prec, test_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask, mode=mode)
         
         epoch_time = time.time() - epoch_start
         
@@ -486,9 +538,9 @@ def main():
     
     # Final detailed evaluation
     print(f"\nFinal detailed evaluation:")
-    final_train_acc, final_train_f1, final_train_prec, final_train_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask)
-    final_val_acc, final_val_f1, final_val_prec, final_val_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask)
-    final_test_acc, final_test_f1, final_test_prec, final_test_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask)
+    final_train_acc, final_train_f1, final_train_prec, final_train_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.train_mask, mode=mode)
+    final_val_acc, final_val_f1, final_val_prec, final_val_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.val_mask, mode=mode)
+    final_test_acc, final_test_f1, final_test_prec, final_test_rec = evaluate_model(model, data, hyperedge_index, hyperedge_weight, data.test_mask, mode=mode)
     
     print(f"Final Train - Acc: {final_train_acc:.4f}, F1: {final_train_f1:.4f}, Prec: {final_train_prec:.4f}, Rec: {final_train_rec:.4f}")
     print(f"Final Val   - Acc: {final_val_acc:.4f}, F1: {final_val_f1:.4f}, Prec: {final_val_prec:.4f}, Rec: {final_val_rec:.4f}")

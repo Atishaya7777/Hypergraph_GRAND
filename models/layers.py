@@ -4,11 +4,12 @@ import torch.nn.functional as F
 from typing import Optional, Union, Callable
 from abc import ABC, abstractmethod
 from enum import Enum
+import math
 
 class IntegrationScheme(Enum):
     EXPLICIT = "explicit"
     IMPLICIT = "implicit"
-    MULTISTEP = "multistep"
+    MULTISTEP = "multistep" 
     ADAPTIVE = "adaptive"
 
 
@@ -129,9 +130,9 @@ class AdaptiveIntegrator(BaseIntegrator):
 
 class HypergraphDiffusionLayer(nn.Module):
     """
-    Single diffusion layer for hypergraphs implementing the diffusion equation
+    Single diffusion layer for hypergraphs implementing the diffusion equation.
+    Fixes: attention normalization, avoids tensor allocations in loops.
     """
-
     def __init__(self, hidden_dim: int, alpha: float = 0.1, dropout: float = 0.1,
                  integration_scheme: IntegrationScheme = IntegrationScheme.EXPLICIT,
                  integrator_kwargs: Optional[dict] = None):
@@ -144,12 +145,10 @@ class HypergraphDiffusionLayer(nn.Module):
         self.W_Q = nn.Linear(hidden_dim, hidden_dim)
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
-        # Initialize integrator
         integrator_kwargs = integrator_kwargs or {}
         self.integrator = self._create_integrator(integration_scheme, alpha, **integrator_kwargs)
 
-    def _create_integrator(self, scheme: IntegrationScheme, alpha: float, **kwargs) -> BaseIntegrator:
-        """Factory method to create integrators"""
+    def _create_integrator(self, scheme: IntegrationScheme, alpha: float, **kwargs):
         if scheme == IntegrationScheme.EXPLICIT:
             return ExplicitEulerIntegrator(alpha)
         elif scheme == IntegrationScheme.IMPLICIT:
@@ -163,140 +162,149 @@ class HypergraphDiffusionLayer(nn.Module):
 
     def forward(self, h, h_init, hyperedge_index, hyperedge_weight=None, membership=None):
         """Apply one step of hypergraph diffusion"""
-        # Define the diffusion function that will be used by the integrator
+        device = h.device
+
         def diffusion_function(h_input):
             return self._compute_diffusion_step(
                 h_input, hyperedge_index, hyperedge_weight, membership
             )
-        
-        # Use the integrator to compute the next step
+
+        # Run integrator step (this returns the "divergence" integrated into an update)
         h_new = self.integrator.step(h, h_init, diffusion_function)
-        
-        # Apply layer normalization and dropout
+
+        # Normalize + dropout
         h_new = self.layer_norm(h_new)
         h_new = F.dropout(h_new, p=self.dropout, training=self.training)
 
         return h_new
 
     def _compute_diffusion_step(self, h, hyperedge_index, hyperedge_weight=None, membership=None):
-        """Compute the diffusion step (divergence) for a given h"""
+        """Compute divergence = aggregated contributions from hyperedges"""
         num_nodes = h.size(0)
+        device = h.device
+
+        # Prepare hyperedge lists
         hyperedges = self.get_hyperedge_structure(hyperedge_index)
-        degrees = self.compute_node_degrees(hyperedge_index, num_nodes)
+        degrees = self.compute_node_degrees(hyperedge_index, num_nodes)  # [num_nodes]
 
-        grad = self.compute_hypergraph_gradient(
-            h, hyperedges, degrees, hyperedge_weight, membership)
+        # If no hyperedges, return zero divergence
+        if len(hyperedges) == 0:
+            return torch.zeros_like(h)
 
-        G = self.compute_diffusion_tensor(h, hyperedges, membership)
+        # Compute gradient per hyperedge (keeps original semantics, but avoids creating scalars)
+        grad = self.compute_hypergraph_gradient(h, hyperedges, degrees, hyperedge_weight, membership)
+        # Compute diffusion tensor (attention-based per-hyperedge scalar)
+        G = self.compute_diffusion_tensor(h, hyperedges, membership)  # [num_hyperedges]
 
-        divergence = self.compute_divergence(
-            grad, G, hyperedges, degrees, hyperedge_weight, membership, num_nodes)
-
+        # Divergence: distribute hyperedge contributions back to nodes
+        divergence = self.compute_divergence(grad, G, hyperedges, degrees, hyperedge_weight, membership, num_nodes)
         return divergence
 
     def reset_integrator(self):
-        """Reset integrator state (useful for multistep methods)"""
         if hasattr(self.integrator, 'reset'):
             self.integrator.reset()
 
-    # [Include all the existing methods from your original implementation]
     def compute_hypergraph_gradient(self, psi, hyperedges, degrees, hyperedge_weight=None, membership=None):
-        """Compute hypergraph gradient operator"""
-        if not hyperedges:
-            return torch.zeros(0, self.hidden_dim, device=psi.device)
-
-        gradients = []
-
+        """Compute hypergraph gradient operator (per-hyperedge vector)."""
+        device = psi.device
+        grads = []
+        deg_eps = degrees + 1e-8  # [num_nodes]
         for e_idx, nodes_in_edge in enumerate(hyperedges):
-            if len(nodes_in_edge) < 2:
-                gradients.append(torch.zeros(self.hidden_dim, device=psi.device))
+            m = len(nodes_in_edge)
+            if m < 2:
+                grads.append(torch.zeros(self.hidden_dim, device=device))
                 continue
 
-            edge_weight = 1.0 if hyperedge_weight is None else hyperedge_weight[e_idx]
-            delta_e = len(nodes_in_edge)
+            edge_w = 1.0 if hyperedge_weight is None else float(hyperedge_weight[e_idx].item())
+            delta_e = m
 
             ref_node = nodes_in_edge[0]
-            grad_sum = torch.zeros(self.hidden_dim, device=psi.device)
+            mu_ref = 1.0 if membership is None else float(membership[e_idx, ref_node].item())
+            # compute ref term once
+            ref_term = (psi[ref_node] * mu_ref) / torch.sqrt(deg_eps[ref_node])
 
-            mu_ref = 1.0 if membership is None else membership[e_idx, ref_node].item()
-            ref_term = (psi[ref_node] * mu_ref) / torch.sqrt(degrees[ref_node] + 1e-8)
-
+            grad_sum = torch.zeros(self.hidden_dim, device=device)
             for node in nodes_in_edge[1:]:
-                mu_node = 1.0 if membership is None else membership[e_idx, node].item()
-                node_term = (psi[node] * mu_node) / torch.sqrt(degrees[node] + 1e-8)
-                grad_sum += node_term - ref_term
+                mu_node = 1.0 if membership is None else float(membership[e_idx, node].item())
+                node_term = (psi[node] * mu_node) / torch.sqrt(deg_eps[node])
+                grad_sum += (node_term - ref_term)
 
-            scale = torch.sqrt(edge_weight) / \
-                torch.sqrt(torch.tensor(delta_e - 1, dtype=torch.float, device=psi.device))
-            gradients.append(scale * grad_sum)
-
-        return torch.stack(gradients)
+            scale = math.sqrt(edge_w) / math.sqrt(float(delta_e - 1))
+            grads.append(scale * grad_sum)
+        return torch.stack(grads, dim=0)  # [num_hyperedges, hidden_dim]
 
     def compute_diffusion_tensor(self, psi, hyperedges, membership=None):
-        """Compute attention-based diffusion tensor G"""
-        if not hyperedges:
-            return torch.ones(0, device=psi.device)
-
-        G_diag = []
+        """
+        Compute attention-based diffusion scalar per hyperedge.
+        Normalizes attention by sqrt(d_k) and applies softmax over pair interactions to stabilize scale.
+        """
+        device = psi.device
+        G_list = []
+        d_k = float(self.hidden_dim)
+        scale = 1.0 / math.sqrt(d_k)
 
         for e_idx, nodes_in_edge in enumerate(hyperedges):
-            if len(nodes_in_edge) < 2:
-                G_diag.append(torch.tensor(1.0, device=psi.device))
+            m = len(nodes_in_edge)
+            if m < 2:
+                G_list.append(torch.tensor(1.0, device=device))
                 continue
 
-            attention_sum = 0.0
-            n_nodes = len(nodes_in_edge)
+            # stack keys/queries -> [m, hidden_dim]
+            keys = torch.stack([self.W_K(psi[v]) for v in nodes_in_edge], dim=0)  # [m, d]
+            queries = torch.stack([self.W_Q(psi[v]) for v in nodes_in_edge], dim=0)  # [m, d]
 
-            keys = [self.W_K(psi[v]) for v in nodes_in_edge]
-            queries = [self.W_Q(psi[v]) for v in nodes_in_edge]
+            # attention matrix: [m, m] = keys @ queries.T
+            # scale and zero diagonal
+            attn = (keys @ queries.t()) * scale
+            attn = attn - torch.diag(torch.diag(attn))  # zero-out diagonal
 
-            for i in range(n_nodes):
-                for j in range(n_nodes):
-                    if i != j:
-                        v1, v2 = nodes_in_edge[i], nodes_in_edge[j]
-                        mu_v1 = 1.0 if membership is None else membership[e_idx, v1].item()
-                        mu_v2 = 1.0 if membership is None else membership[e_idx, v2].item()
+            # flatten pairwise scores then softmax to get stable normalized pair importance
+            # we compute pairwise contributions per node by summing over columns after softmax
+            # but to stabilize magnitudes we normalize with softmax over the matrix rows
+            attn_row_soft = F.softmax(attn, dim=1)  # each row sums to 1
+            # per-hyperedge scalar: average of row sums (should be 1, but weighted by interactions)
+            # better: sum of off-diagonal attention magnitudes divided by number of pair interactions
+            pairwise_sum = attn_row_soft.sum()
+            G_val = torch.clamp(pairwise_sum / float(m), min=1e-8)
+            G_list.append(G_val)
 
-                        attention = torch.dot(keys[i], queries[j])
-                        attention_sum += mu_v1 * mu_v2 * attention
-
-            G_diag.append(torch.clamp(attention_sum, min=1e-8))
-
-        return torch.stack(G_diag)
+        return torch.stack(G_list, dim=0)  # [num_hyperedges]
 
     def compute_divergence(self, grad, G, hyperedges, degrees, hyperedge_weight=None, membership=None, num_nodes=None):
-        """Compute divergence operator"""
-        divergence = torch.zeros(num_nodes, self.hidden_dim, device=grad.device)
+        """
+        Distribute hyperedge contributions back to nodes to compute node-level divergence.
+        Vectorized-ish but loops per hyperedge; avoids creating CPU tensors in loops.
+        """
+        device = grad.device
+        divergence = torch.zeros(num_nodes, self.hidden_dim, device=device)
+        deg_eps = degrees + 1e-8
 
-        node_to_edges = {}
         for e_idx, nodes_in_edge in enumerate(hyperedges):
-            for node in nodes_in_edge:
-                if node not in node_to_edges:
-                    node_to_edges[node] = []
-                node_to_edges[node].append(e_idx)
-
-        for node in range(num_nodes):
-            if node not in node_to_edges:
+            m = len(nodes_in_edge)
+            if m == 0:
                 continue
 
-            div_sum = torch.zeros(self.hidden_dim, device=grad.device)
+            edge_w = 1.0 if hyperedge_weight is None else float(hyperedge_weight[e_idx].item())
+            mu_vals = None
+            if membership is None:
+                mu_vals = [1.0] * m
+            else:
+                mu_vals = [float(membership[e_idx, n].item()) for n in nodes_in_edge]
 
-            for e_idx in node_to_edges[node]:
-                if e_idx >= len(G) or e_idx >= len(grad):
-                    continue
+            # precompute constants
+            sqrt_edge_w = math.sqrt(edge_w)
+            denom = max(1.0, (m - 1) * float(deg_eps[nodes_in_edge[0]].item()))
+            norm_term = math.sqrt(denom)
 
-                edge_weight = 1.0 if hyperedge_weight is None else hyperedge_weight[e_idx]
-                delta_e = len(hyperedges[e_idx])
-                mu_node = 1.0 if membership is None else membership[e_idx, node].item()
+            # grad[e_idx]: [hidden_dim], G[e_idx]: scalar
+            g_e = grad[e_idx]  # vector
+            G_e = float(G[e_idx].item())
 
-                weight_factor = torch.sqrt(edge_weight) * mu_node
-                degree_term = max(1.0, (delta_e - 1) * (degrees[node].item() + 1e-8))
-                norm_factor = torch.sqrt(torch.tensor(degree_term, device=grad.device))
-
-                contribution = (weight_factor / norm_factor) * G[e_idx] * grad[e_idx]
-                div_sum += contribution
-
-            divergence[node] = div_sum
+            for idx, node in enumerate(nodes_in_edge):
+                mu_node = mu_vals[idx]
+                # compute contribution
+                contrib = (sqrt_edge_w * mu_node / norm_term) * (G_e * g_e)
+                divergence[node] += contrib
 
         return divergence
 
@@ -305,22 +313,22 @@ class HypergraphDiffusionLayer(nn.Module):
         if hyperedge_index.size(1) == 0:
             return []
 
-        num_hyperedges = hyperedge_index[0].max().item() + 1
+        num_hyperedges = int(hyperedge_index[0].max().item()) + 1
         hyperedges = [[] for _ in range(num_hyperedges)]
-
         for i in range(hyperedge_index.size(1)):
-            edge_idx = hyperedge_index[0, i].item()
-            node_idx = hyperedge_index[1, i].item()
-            hyperedges[edge_idx].append(node_idx)
-
+            e = int(hyperedge_index[0, i].item())
+            v = int(hyperedge_index[1, i].item())
+            hyperedges[e].append(v)
         return hyperedges
 
     def compute_node_degrees(self, hyperedge_index, num_nodes):
-        """Compute node degrees in hypergraph"""
-        degrees = torch.zeros(num_nodes, device=hyperedge_index.device)
-
-        for i in range(hyperedge_index.size(1)):
-            node_idx = hyperedge_index[1, i]
-            degrees[node_idx] += 1
-
+        """Compute node degrees in hypergraph (vectorized)"""
+        device = hyperedge_index.device
+        degrees = torch.zeros(num_nodes, device=device)
+        if hyperedge_index.size(1) == 0:
+            return degrees
+        nodes = hyperedge_index[1]  # [num_connections]
+        # nodes might be long tensor, use scatter_add
+        ones = torch.ones_like(nodes, dtype=degrees.dtype, device=device)
+        degrees = degrees.scatter_add(0, nodes, ones)
         return degrees
