@@ -266,7 +266,7 @@ def run_validation_mode(args):
                 result = validate_dataset(loader, dataset_name, task_type)
                 if result['valid']:
                     passed += 1
-                    print(f"  ✓ {dataset_name:<30} | nodes={result['num_nodes']:>8} | classes={result['num_classes']:>2} | features={result['num_features']:>5} | edges={result['num_edges']:>8}")
+                    print(f"    {dataset_name:<30} | nodes={result['num_nodes']:>8} | classes={result['num_classes']:>2} | features={result['num_features']:>5} | edges={result['num_edges']:>8}")
                 else:
                     print(f"  ✗ {dataset_name:<30} | {result.get('error', '')[:50]}")
             except Exception as e:

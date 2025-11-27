@@ -375,7 +375,7 @@ class PyGDatasetLoader:
                     seed=seed
                 )
                 datasets[dataset_name] = data
-                print("✓")
+                print(" ")
             except Exception as e:
                 print(f"✗ Error: {str(e)}")
                 continue
@@ -500,7 +500,7 @@ if __name__ == "__main__":
     # Verify integrity
     is_valid, issues = processor.verify_data_integrity(cora_data)
     if is_valid:
-        print("\n✓ Data integrity check passed")
+        print("\n  Data integrity check passed")
     else:
         print("\n✗ Data integrity issues found:")
         for issue in issues:

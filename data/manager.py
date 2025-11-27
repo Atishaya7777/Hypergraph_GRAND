@@ -302,7 +302,7 @@ class UnifiedDataManager:
                 }
                 
                 if is_valid:
-                    print("✓")
+                    print(" ")
                 else:
                     print("✗")
                     for issue in issues:
@@ -413,4 +413,4 @@ if __name__ == "__main__":
     
     # results = manager.verify_datasets(['planetoid_cora'])
     # for dataset_name, result in results.items():
-    #     print(f"{dataset_name}: {'✓ Valid' if result['valid'] else '✗ Invalid'}")
+    #     print(f"{dataset_name}: {'  Valid' if result['valid'] else '✗ Invalid'}")

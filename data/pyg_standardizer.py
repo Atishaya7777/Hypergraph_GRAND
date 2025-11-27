@@ -656,7 +656,7 @@ class DatasetLoader:
         
         if verbose:
             num_classes = data.metadata.num_classes if hasattr(data, 'metadata') else int(data.y.max().item()) + 1
-            print(f"  ✓ {data.num_nodes} nodes, {num_classes} classes")
+            print(f"    {data.num_nodes} nodes, {num_classes} classes")
         
         return data
     

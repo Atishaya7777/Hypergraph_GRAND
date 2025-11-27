@@ -48,9 +48,9 @@ venv:
 	@echo "$(BLUE) Creating virtual environment...$(NC)"
 	@if [ ! -d "$(VENV_NAME)" ]; then \
 		$(PYTHON) -m venv $(VENV_NAME); \
-		echo "$(GREEN)✓ Virtual environment created$(NC)"; \
+		echo "$(GREEN)  Virtual environment created$(NC)"; \
 	else \
-		echo "$(YELLOW)⚠️  Virtual environment already exists$(NC)"; \
+		echo "$(YELLOW)   Virtual environment already exists$(NC)"; \
 	fi
 
 install: venv 
@@ -58,9 +58,9 @@ install: venv
 	@$(PIP) install --upgrade pip
 	@if [ -f "$(REQUIREMENTS_FILE)" ]; then \
 		$(PIP) install -r $(REQUIREMENTS_FILE); \
-		echo "$(GREEN)✓ Dependencies installed from requirements.txt$(NC)"; \
+		echo "$(GREEN)  Dependencies installed from requirements.txt$(NC)"; \
 	else \
-		echo "$(YELLOW)⚠️  requirements.txt not found$(NC)"; \
+		echo "$(YELLOW)   requirements.txt not found$(NC)"; \
 	fi
 
 test: venv install
@@ -85,7 +85,7 @@ train-all: venv install
 	@echo "$(BLUE) Training on ALL 16 datasets...$(NC)"
 	@echo "$(YELLOW) This may take a while. Training will resume from saved progress if interrupted.$(NC)"
 	@$(PYTHON_VENV) $(MAIN_FILE) --mode batch --epochs $(EPOCHS) --patience $(PATIENCE) --save-results training_results.json
-	@echo "$(GREEN)✓ Training complete. Results saved to training_results.json$(NC)"
+	@echo "$(GREEN)  Training complete. Results saved to training_results.json$(NC)"
 
 mlflow: venv install
 	@echo "$(BLUE) Starting MLflow UI server...$(NC)"
@@ -99,4 +99,4 @@ clean:
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@find . -name "*.png" -type f -delete 2>/dev/null || true
 	@rm -rf .pytest_cache 2>/dev/null || true
-	@echo "$(GREEN)✓ Cleaned generated files and cache$(NC)"
+	@echo "$(GREEN)  Cleaned generated files and cache$(NC)"

@@ -405,9 +405,9 @@ def print_summary(results: Dict):
             if task_type == 'clustering':
                 nmi = result.get('test_nmi', 0.0)
                 ari = result.get('test_ari', 0.0)
-                print(f"✓ {dataset_name:<30} | NMI: {nmi:.4f} | ARI: {ari:.4f} | Loss: {test_loss:.4f}")
+                print(f"  {dataset_name:<30} | NMI: {nmi:.4f} | ARI: {ari:.4f} | Loss: {test_loss:.4f}")
             else:
-                print(f"✓ {dataset_name:<30} | Acc: {metric_val:.4f} | Loss: {test_loss:.4f}")
+                print(f"  {dataset_name:<30} | Acc: {metric_val:.4f} | Loss: {test_loss:.4f}")
             
             by_task[task_type]['results'].append((dataset_name, metric_val, test_loss))
     
