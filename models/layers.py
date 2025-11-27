@@ -25,7 +25,7 @@ class BaseIntegrator(ABC):
         pass
 
 class ExplicitEulerIntegrator(BaseIntegrator):
-    """Explicit Euler integration: h_{t+1} = h_t + α * f(h_t)"""
+    """Explicit Euler integration: h_{t+1} = h_t + \alpha * f(h_t)"""
     
     def step(self, h_current: torch.Tensor, diffusion_fn: Callable, *args, **kwargs) -> torch.Tensor:
         divergence = diffusion_fn(h_current, *args, **kwargs)

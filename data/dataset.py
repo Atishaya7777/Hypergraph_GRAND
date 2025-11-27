@@ -600,6 +600,171 @@ class PlanetoidHypergraphDataset(HypergraphDataset):
 
 
 
+class GenericHypergraphDataLoader(DataLoader):
+    """Generic loader for hypergraph datasets with standard file format"""
+
+    def load_raw_data(self, path: Union[str, Path]) -> Dict:
+        """Load generic hypergraph data from standardized files"""
+        path = Path(path).expanduser()
+        dataset_name = path.name if path.is_dir() else path.stem
+
+        # Try to load hyperedges
+        hyperedges_file = path / f"hyperedges-{dataset_name}.txt"
+        if not hyperedges_file.exists():
+            hyperedges_file = path / "hyperedges.txt"
+        
+        if not hyperedges_file.exists():
+            # Try with .edges extension
+            hyperedges_file = path / f"{dataset_name}.edges"
+        
+        if not hyperedges_file.exists():
+            raise FileNotFoundError(f"Hyperedges file not found in {path}")
+
+        hyperedges = []
+        with open(hyperedges_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Handle both space and comma separated formats
+                    if ',' in line:
+                        nodes = [int(x.strip()) for x in line.split(',')]
+                    else:
+                        nodes = [int(x.strip()) for x in line.split()]
+                    if nodes:  # Only add non-empty hyperedges
+                        hyperedges.append(nodes)
+
+        # Try to load node labels
+        node_labels_file = path / f"node-labels-{dataset_name}.txt"
+        if not node_labels_file.exists():
+            node_labels_file = path / "node-labels.txt"
+        
+        if not node_labels_file.exists():
+            # Try with .content extension (like Cora/CiteSeer)
+            node_labels_file = path / f"{dataset_name}.content"
+
+        labels = None
+        label_names = []
+        
+        if node_labels_file.exists():
+            with open(node_labels_file, 'r') as f:
+                labels = []
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        # Handle comma-separated labels (multi-label)
+                        if ',' in line:
+                            label_indices = [int(x.strip()) for x in line.split(',')]
+                            # For multi-label, we'll use the first label for single-label tasks
+                            labels.append(label_indices[0] if label_indices else 0)
+                        else:
+                            try:
+                                labels.append(int(line))
+                            except ValueError:
+                                # String label
+                                labels.append(line)
+
+        # Try to load label names
+        label_names_file = path / f"label-names-{dataset_name}.txt"
+        if not label_names_file.exists():
+            label_names_file = path / "label-names.txt"
+
+        if label_names_file.exists():
+            with open(label_names_file, 'r') as f:
+                label_names = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+
+        if not label_names and labels:
+            num_classes = len(set(labels))
+            label_names = [f"Class_{i}" for i in range(num_classes)]
+
+        return {
+            'labels': labels,
+            'hyperedges': hyperedges,
+            'label_names': label_names,
+            'dataset_name': dataset_name
+        }
+
+
+class GenericHypergraphDataset(HypergraphDataset):
+    """Generic dataset class for hypergraph data with standard format"""
+    
+    def __init__(self):
+        super().__init__(
+            data_loader=GenericHypergraphDataLoader(),
+            converter=IdentityHypergraphConverter()
+        )
+    
+    def load_data(self, path: Union[str, Path], **kwargs) -> HypergraphData:
+        """Load generic hypergraph dataset"""
+        raw_data = self.data_loader.load_raw_data(path)
+        
+        hyperedges = self.converter.convert_to_hypergraph(raw_data, **kwargs)
+        
+        # Convert labels
+        raw_labels = raw_data['labels']
+        if raw_labels is None or len(raw_labels) == 0:
+            # No labels - create dummy labels for all nodes
+            # Infer number of nodes from hyperedges
+            num_nodes = max(max(edge) for edge in hyperedges) + 1 if hyperedges else 1
+            labels = torch.zeros(num_nodes, dtype=torch.long)
+            num_classes = 1
+            raw_data['label_names'] = ['Unknown']
+        else:
+            if isinstance(raw_labels[0], str):
+                # Use LabelEncoder to convert string labels to integers
+                label_encoder = LabelEncoder()
+                label_indices = label_encoder.fit_transform(raw_labels)
+                labels = torch.tensor(label_indices, dtype=torch.long)
+                # Create label names
+                unique_labels = sorted(set(raw_labels))
+                raw_data['label_names'] = unique_labels
+            else:
+                labels = torch.tensor(raw_labels, dtype=torch.long)
+        
+        num_nodes = len(labels)
+        num_classes = len(torch.unique(labels))
+        
+        self.validator.validate_node_indices(hyperedges, num_nodes)
+        
+        # Use identity features (one-hot encoding)
+        node_features = torch.eye(num_nodes)
+        
+        hyperedge_index = self._create_hyperedge_index(hyperedges)
+        
+        stats = self._compute_dataset_stats(hyperedges, num_nodes)
+        stats.update({
+            'dataset_name': raw_data['dataset_name'],
+            'dataset_type': 'generic_hypergraph'
+        })
+        
+        self._data = HypergraphData(
+            node_features=node_features,
+            labels=labels,
+            hyperedge_index=hyperedge_index,
+            num_nodes=num_nodes,
+            num_hyperedges=len(hyperedges),
+            num_classes=num_classes,
+            label_names=raw_data['label_names'],
+            dataset_info=stats
+        )
+        
+        self.validator.validate_hypergraph_data(self._data)
+        
+        self._print_dataset_info()
+        return self._data
+    
+    def _print_dataset_info(self):
+        """Print dataset information"""
+        data = self._data
+        info = data.dataset_info
+        
+        print(f"Dataset {info['dataset_name']} loaded:")
+        print(f"  - Nodes: {data.num_nodes}")
+        print(f"  - Hyperedges: {data.num_hyperedges}")
+        print(f"  - Classes: {data.num_classes}")
+        print(f"  - Mean hyperedge size: {info['mean_hyperedge_size']:.2f}")
+        print(f"  - Max hyperedge size: {info['max_hyperedge_size']}")
+
+
 class ContactDataset(HypergraphDataset):
     """Dataset class for contact network data"""
     
@@ -615,7 +780,21 @@ class ContactDataset(HypergraphDataset):
         
         hyperedges = self.converter.convert_to_hypergraph(raw_data, **kwargs)
         
-        labels = torch.tensor(raw_data['labels'], dtype=torch.long)
+        # Convert string labels to integers if needed
+        raw_labels = raw_data['labels']
+        if isinstance(raw_labels[0], str):
+            # Use LabelEncoder to convert string labels to integers
+            label_encoder = LabelEncoder()
+            label_indices = label_encoder.fit_transform(raw_labels)
+            labels = torch.tensor(label_indices, dtype=torch.long)
+            # Update label_names to match the encoded labels
+            if 'label_names' in raw_data:
+                # Create mapping from encoded index to original label name
+                unique_labels = sorted(set(raw_labels))
+                raw_data['label_names'] = unique_labels
+        else:
+            labels = torch.tensor(raw_labels, dtype=torch.long)
+        
         num_nodes = len(labels)
         num_classes = len(torch.unique(labels))
         
@@ -702,24 +881,66 @@ class DataSplitter:
 
 # Factory function for easy dataset creation
 def create_hypergraph_dataset(dataset_type: str, **kwargs) -> HypergraphDataset:
-    """Factory function to create appropriate dataset instance"""
-    if dataset_type.lower() == 'contact':
+    """
+    Factory function to create appropriate dataset instance
+    
+    Args:
+        dataset_type: Type of dataset. Can be:
+            - 'contact': Contact networks
+            - 'planetoid_cora', 'planetoid_citeseer', 'planetoid_pubmed': Planetoid datasets
+            - Generic dataset names: 'contact_high_school', 'contact_primary_school', 'walmart_trips',
+              'stackoverflow_answers', 'amazon_reviews', 'zoo', 'mushroom', 'ntu2012', 'modelnet40',
+              'house_committees', '20newsW100', 'coauthorship', 'cocitation', 'yelp'
+        **kwargs: Additional arguments for dataset configuration
+    
+    Returns:
+        HypergraphDataset: Appropriate dataset instance
+    """
+    dataset_type = dataset_type.lower()
+    
+    # Contact networks (clustering)
+    if dataset_type in ['contact', 'contact_high_school', 'contact_primary_school']:
         return ContactDataset()
-    elif dataset_type.lower() in ['planetoid', 'planetoid_cora', 'planetoid_citeseer', 'planetoid_pubmed']:
+    
+    # Planetoid datasets (classification)
+    elif dataset_type in ['planetoid', 'planetoid_cora', 'planetoid_citeseer', 'planetoid_pubmed']:
         # Extract dataset name from type
-        if dataset_type.lower() == 'planetoid_cora' or dataset_type.lower() == 'planetoid':
+        if dataset_type == 'planetoid_cora' or dataset_type == 'planetoid':
             dataset_name = 'Cora'
-        elif dataset_type.lower() == 'planetoid_citeseer':
+        elif dataset_type == 'planetoid_citeseer':
             dataset_name = 'CiteSeer'
-        elif dataset_type.lower() == 'planetoid_pubmed':
+        elif dataset_type == 'planetoid_pubmed':
             dataset_name = 'PubMed'
         else:
             dataset_name = kwargs.get('dataset_name', 'Cora')
 
         strategy = kwargs.get('hypergraph_strategy', 'co_citation_expansion')
         return PlanetoidHypergraphDataset(dataset_name=dataset_name, hypergraph_strategy=strategy, normalize_features=True)
+    
+    # Generic hypergraph datasets (clustering and others)
+    elif dataset_type in [
+        'walmart_trips',
+        'stackoverflow_answers',
+        'amazon_reviews',
+        'zoo',
+        'mushroom',
+        'ntu2012',
+        'modelnet40',
+        'house_committees',
+        '20newsW100',
+        'coauthorship',
+        'cocitation',
+        'yelp'
+    ]:
+        return GenericHypergraphDataset()
+    
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
+        raise ValueError(
+            f"Unknown dataset type: {dataset_type}. "
+            f"Supported types: 'contact', 'planetoid_cora', 'planetoid_citeseer', 'planetoid_pubmed', "
+            f"'walmart_trips', 'stackoverflow_answers', 'amazon_reviews', 'zoo', 'mushroom', 'ntu2012', "
+            f"'modelnet40', 'house_committees', '20newsW100', 'coauthorship', 'cocitation', 'yelp'"
+        )
 
 
 '''
