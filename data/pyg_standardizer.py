@@ -332,9 +332,18 @@ class UniversalDataConverter:
         if 'hypergraph' in pickle_files:
             with open(pickle_files['hypergraph'], 'rb') as f:
                 hg = pickle.load(f)
-                if isinstance(hg, dict) and 'hyperedge_index' in hg:
-                    hyperedge_index = hg['hyperedge_index']
+                
+                # Handle different hypergraph formats
+                if isinstance(hg, dict):
+                    if 'hyperedge_index' in hg:
+                        # Format: {'hyperedge_index': tensor}
+                        hyperedge_index = hg['hyperedge_index']
+                    else:
+                        # Format: {node_id: [connected_nodes]} or {name: [node_ids]}
+                        # This is the co-authorship/co-citation format
+                        hyperedge_index = self._convert_dict_to_hyperedges(hg)
                 elif isinstance(hg, (list, tuple)):
+                    # Direct hyperedge list format
                     hyperedge_index = torch.tensor(hg, dtype=torch.long)
         
         num_nodes = labels.shape[0] if labels is not None else features.shape[0]
@@ -346,10 +355,46 @@ class UniversalDataConverter:
             num_nodes=num_nodes
         )
     
+    def _convert_dict_to_hyperedges(self, hg_dict: Dict) -> torch.Tensor:
+        """Convert dict-based hypergraph to hyperedge_index tensor
+        
+        Handles formats like:
+        - {name: [node_ids]}: Co-authorship/co-citation networks
+        - {node_id: {cited_nodes}}: Co-citation networks with sets
+        - Each entry becomes a hyperedge
+        """
+        edge_list = []
+        node_to_edge = {}
+        edge_counter = 0
+        
+        for hyperedge_id, node_ids in hg_dict.items():
+            # Handle different node collection types
+            if isinstance(node_ids, set):
+                node_list = list(node_ids)
+            elif isinstance(node_ids, (list, tuple)):
+                node_list = list(node_ids)
+            else:
+                continue
+            
+            for node_id in node_list:
+                # Ensure node_id is an integer
+                if isinstance(node_id, (int, np.integer)):
+                    edge_list.append([edge_counter, int(node_id)])
+            
+            if node_list:  # Only increment if this hyperedge has nodes
+                edge_counter += 1
+        
+        if edge_list:
+            hyperedge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+            return hyperedge_index
+        else:
+            return torch.zeros((2, 0), dtype=torch.long)
+    
     def _load_content_edges_format(self, path: Path) -> Data:
-        """Load content/edges format (Cora-like)"""
+        """Load content/edges format (Cora-like and zoo-like)"""
         content_file = list(path.glob('*.content'))
-        cites_file = list(path.glob('*.cites'))
+        cites_files = list(path.glob('*.cites'))
+        edges_files = list(path.glob('*.edges'))
         
         node_ids = []
         features = []
@@ -359,17 +404,28 @@ class UniversalDataConverter:
             with open(content_file[0], 'r') as f:
                 for line in f:
                     parts = line.strip().split('\t')
-                    node_ids.append(int(parts[0]))
+                    # Check if first element is numeric (node ID format)
+                    try:
+                        first_val = int(parts[0])
+                        node_ids.append(first_val)
+                        feature_parts = parts[1:-1]
+                        label_part = parts[-1]
+                    except ValueError:
+                        # No node ID, features are from the beginning
+                        feature_parts = parts[:-1]
+                        label_part = parts[-1]
+                        node_ids.append(len(node_ids))
+                    
                     # Handle both int and float features - parse as float for flexibility
                     try:
-                        features.append(list(map(float, parts[1:-1])))
+                        features.append(list(map(float, feature_parts)))
                     except ValueError:
-                        features.append(list(map(float, parts[1:-1])))
+                        features.append(list(map(float, feature_parts)))
                     # Label should always be int
                     try:
-                        labels.append(int(parts[-1]))
+                        labels.append(int(label_part))
                     except ValueError:
-                        labels.append(int(float(parts[-1])))
+                        labels.append(int(float(label_part)))
         
         id_map = {nid: idx for idx, nid in enumerate(node_ids)}
         num_nodes = len(node_ids)
@@ -377,20 +433,27 @@ class UniversalDataConverter:
         features = torch.tensor(features, dtype=torch.float32)
         labels = torch.tensor(labels, dtype=torch.long)
         
-        # Load edges
-        edges = [[], []]
-        if cites_file:
-            with open(cites_file[0], 'r') as f:
+        # Parse edges - can be pairwise graph edges or node-to-hyperedge mappings
+        hyperedge_index = None
+        if edges_files:
+            hyperedge_index = self._parse_edges_file(edges_files[0], id_map, num_nodes)
+        elif cites_files:
+            # Convert pairwise graph edges into hyperedges (each graph edge -> one hyperedge containing both endpoints)
+            hyperedge_list = []
+            with open(cites_files[0], 'r') as f:
                 for line in f:
                     parts = line.strip().split()
+                    if len(parts) < 2:
+                        continue
                     src, dst = int(parts[0]), int(parts[1])
                     if src in id_map and dst in id_map:
-                        edges[0].append(id_map[src])
-                        edges[1].append(id_map[dst])
-                        edges[0].append(id_map[dst])
-                        edges[1].append(id_map[src])
-        
-        hyperedge_index = torch.tensor(edges, dtype=torch.long) if edges[0] else None
+                        s_idx = id_map[src]
+                        d_idx = id_map[dst]
+                        # create a hyperedge containing both nodes
+                        hyperedge_list.append([s_idx, d_idx])
+            
+            # Use helper to create [hyperedge_id, node_id] tensor
+            hyperedge_index = self._create_hyperedge_index(hyperedge_list, num_nodes) if hyperedge_list else None
         
         return Data(
             x=features,
@@ -398,6 +461,45 @@ class UniversalDataConverter:
             hyperedge_index=hyperedge_index,
             num_nodes=num_nodes
         )
+    
+    def _parse_edges_file(self, edges_file_path, id_map, num_nodes):
+        """Parse edges file - assumes node-to-hyperedge format [node_id, hyperedge_id]"""
+        edge_dict = {}  # hyperedge_id -> [node_indices]
+        
+        with open(edges_file_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                
+                node_id = int(parts[0])
+                hyperedge_id = int(parts[1])
+                
+                # Map node ID to index
+                if node_id in id_map:
+                    node_idx = id_map[node_id]
+                else:
+                    # If node ID not in id_map, try using it as an index directly
+                    if node_id < num_nodes:
+                        node_idx = node_id
+                    else:
+                        continue  # Skip out-of-bounds nodes
+                
+                # Node-to-hyperedge format
+                if hyperedge_id not in edge_dict:
+                    edge_dict[hyperedge_id] = []
+                edge_dict[hyperedge_id].append(node_idx)
+        
+        # Convert to [hyperedge_id, node_id] tensor
+        hyperedge_list = []
+        for he_id in sorted(edge_dict.keys()):
+            for node_idx in edge_dict[he_id]:
+                hyperedge_list.append([he_id, node_idx])
+        
+        if hyperedge_list:
+            return torch.tensor(hyperedge_list, dtype=torch.long).t().contiguous()
+        else:
+            return torch.zeros((2, 0), dtype=torch.long)
     
     def _load_generic_format(self, path: Path) -> Data:
         """Generic fallback loader"""
@@ -432,18 +534,20 @@ class UniversalDataConverter:
     
     def _create_hyperedge_index(self, hyperedges: list, num_nodes: int) -> torch.Tensor:
         """Convert hyperedges to COO format"""
-        rows, cols = [], []
+        # Produce tensor in [hyperedge_id, node_id] order expected by model
+        he_ids = []
+        node_ids = []
         for edge_id, nodes in enumerate(hyperedges):
             for node in nodes:
                 if 0 <= node < num_nodes:
-                    rows.append(node)
-                    cols.append(edge_id)
-        
-        if not rows:
+                    he_ids.append(edge_id)
+                    node_ids.append(node)
+
+        if not he_ids:
             return torch.zeros((2, 0), dtype=torch.long)
-        
-        return torch.stack([torch.tensor(rows, dtype=torch.long),
-                           torch.tensor(cols, dtype=torch.long)], dim=0)
+
+        return torch.stack([torch.tensor(he_ids, dtype=torch.long),
+                            torch.tensor(node_ids, dtype=torch.long)], dim=0)
     
     def _normalize_features(self, features: torch.Tensor) -> torch.Tensor:
         """Normalize features to [0, 1]"""

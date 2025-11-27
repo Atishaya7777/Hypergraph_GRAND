@@ -2,6 +2,7 @@
 """
 Training script for HyperGRAND model on validated datasets
 Passes validated PyG Data objects to the model for training
+Supports task-aware training: classification, clustering, partitioning
 """
 
 import sys
@@ -9,9 +10,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import numpy as np
 from tqdm import tqdm
+from sklearn.cluster import KMeans
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, accuracy_score
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -20,24 +23,63 @@ from models.hypergrand import create_hypergrand_model
 from torch_geometric.data import Data
 
 
+class TaskAwareHead(nn.Module):
+    """Task-specific output head"""
+    def __init__(self, input_dim: int, num_classes: int, task_type: str = 'classification'):
+        super().__init__()
+        self.task_type = task_type
+        self.num_classes = num_classes
+        
+        if task_type in ['classification', 'partitioning']:
+            # Classification/partitioning: linear layer + softmax
+            self.head = nn.Linear(input_dim, num_classes)
+        elif task_type == 'clustering':
+            # Clustering: use embeddings directly, apply k-means at test time
+            self.head = nn.Linear(input_dim, num_classes)  # Still need linear for initialization
+        else:
+            raise ValueError(f"Unknown task type: {task_type}")
+    
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        if self.task_type in ['classification', 'partitioning']:
+            return self.head(h)
+        else:  # clustering
+            return self.head(h)
+
+
 class HyperGRANDTrainer:
-    """Trainer for HyperGRAND model on PyG Data objects"""
+    """Task-aware trainer for HyperGRAND model on PyG Data objects"""
     
     def __init__(
         self,
         model: nn.Module,
+        head: TaskAwareHead,
+        task_type: str = 'classification',
         device: torch.device = None,
         learning_rate: float = 0.01,
         weight_decay: float = 1e-5
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
-        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        self.criterion = nn.CrossEntropyLoss()
+        self.head = head.to(self.device)
+        self.task_type = task_type
+        
+        self.optimizer = optim.Adam(
+            list(self.model.parameters()) + list(self.head.parameters()),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        
+        if task_type in ['classification', 'partitioning']:
+            self.criterion = nn.CrossEntropyLoss()
+        elif task_type == 'clustering':
+            # For clustering, use cross-entropy on pseudo-labels or just embeddings
+            self.criterion = nn.CrossEntropyLoss()
+        else:
+            raise ValueError(f"Unknown task type: {task_type}")
         
         self.train_losses = []
         self.val_losses = []
-        self.val_accuracies = []
+        self.val_metrics = []
     
     def _move_to_device(self, data: Data):
         """Move data to device"""
@@ -49,21 +91,22 @@ class HyperGRANDTrainer:
         data.test_mask = data.test_mask.to(self.device)
         return data
     
-    def forward_pass(self, data: Data, num_classes: int) -> torch.Tensor:
+    def forward_pass(self, data: Data) -> torch.Tensor:
         """Forward pass through the model"""
         # Get latent representations from HyperGRAND
         h = self.model(data.x, data.hyperedge_index)
         
-        # Add classification head
-        logits = nn.Linear(h.shape[1], num_classes, device=self.device)(h)
+        # Apply task-specific head
+        logits = self.head(h)
         return logits
     
-    def train_epoch(self, data: Data, num_classes: int) -> Tuple[float, float]:
+    def train_epoch(self, data: Data) -> Tuple[float, float]:
         """Train for one epoch"""
         self.model.train()
+        self.head.train()
         
         # Forward pass
-        logits = self.forward_pass(data, num_classes)
+        logits = self.forward_pass(data)
         
         # Compute loss on training nodes
         loss = self.criterion(logits[data.train_mask], data.y[data.train_mask])
@@ -71,31 +114,62 @@ class HyperGRANDTrainer:
         # Backward pass
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            list(self.model.parameters()) + list(self.head.parameters()),
+            max_norm=1.0
+        )
         self.optimizer.step()
         
-        # Compute training accuracy
+        # Compute training metric
         with torch.no_grad():
-            train_acc = (logits[data.train_mask].argmax(dim=1) == data.y[data.train_mask]).float().mean()
+            if self.task_type in ['classification', 'partitioning']:
+                train_metric = (logits[data.train_mask].argmax(dim=1) == data.y[data.train_mask]).float().mean()
+            else:  # clustering
+                train_metric = (logits[data.train_mask].argmax(dim=1) == data.y[data.train_mask]).float().mean()
         
-        return loss.item(), train_acc.item()
+        return loss.item(), train_metric.item()
     
     @torch.no_grad()
-    def evaluate(self, data: Data, num_classes: int, mask: torch.Tensor) -> Tuple[float, float]:
+    def evaluate(self, data: Data, mask: torch.Tensor) -> Tuple[float, float]:
         """Evaluate on given mask (val or test)"""
         self.model.eval()
+        self.head.eval()
         
-        logits = self.forward_pass(data, num_classes)
+        logits = self.forward_pass(data)
         
         loss = self.criterion(logits[mask], data.y[mask])
-        acc = (logits[mask].argmax(dim=1) == data.y[mask]).float().mean()
         
-        return loss.item(), acc.item()
+        if self.task_type in ['classification', 'partitioning']:
+            metric = (logits[mask].argmax(dim=1) == data.y[mask]).float().mean()
+        else:  # clustering - use accuracy as proxy
+            metric = (logits[mask].argmax(dim=1) == data.y[mask]).float().mean()
+        
+        return loss.item(), metric.item()
+    
+    @torch.no_grad()
+    def evaluate_clustering(self, data: Data, mask: torch.Tensor) -> Dict:
+        """Evaluate clustering with k-means"""
+        self.model.eval()
+        
+        # Get embeddings
+        h = self.model(data.x, data.hyperedge_index)
+        h_np = h[mask].cpu().numpy()
+        y_np = data.y[mask].cpu().numpy()
+        
+        # Apply k-means
+        num_classes = int(data.y.max().item()) + 1
+        kmeans = KMeans(n_clusters=num_classes, random_state=42, n_init=10)
+        pred_labels = kmeans.fit_predict(h_np)
+        
+        # Compute metrics
+        nmi = normalized_mutual_info_score(y_np, pred_labels)
+        ari = adjusted_rand_score(y_np, pred_labels)
+        
+        return {'nmi': nmi, 'ari': ari}
     
     def train(
         self,
         data: Data,
-        num_classes: int,
         num_epochs: int = 200,
         patience: int = 50,
         verbose: bool = True
@@ -103,35 +177,41 @@ class HyperGRANDTrainer:
         """Train the model with early stopping"""
         data = self._move_to_device(data)
         
-        best_val_loss = float('inf')
+        best_val_metric = float('inf') if self.task_type != 'clustering' else 0.0
         best_epoch = 0
         patience_counter = 0
         
         results = {
             'train_losses': [],
             'val_losses': [],
-            'val_accuracies': [],
-            'best_val_loss': best_val_loss,
+            'val_metrics': [],
+            'best_val_metric': best_val_metric,
             'best_epoch': 0,
-            'final_test_acc': 0.0,
-            'final_test_loss': 0.0
+            'final_test_loss': 0.0,
+            'final_test_metric': 0.0,
+            'task_type': self.task_type
         }
         
         pbar = tqdm(range(num_epochs), desc="Training", disable=not verbose)
         
         for epoch in pbar:
             # Train
-            train_loss, train_acc = self.train_epoch(data, num_classes)
+            train_loss, train_metric = self.train_epoch(data)
             results['train_losses'].append(train_loss)
             
             # Validate
-            val_loss, val_acc = self.evaluate(data, num_classes, data.val_mask)
+            val_loss, val_metric = self.evaluate(data, data.val_mask)
             results['val_losses'].append(val_loss)
-            results['val_accuracies'].append(val_acc)
+            results['val_metrics'].append(val_metric)
             
             # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if self.task_type != 'clustering':
+                is_better = val_loss < best_val_metric
+            else:
+                is_better = val_metric > best_val_metric
+            
+            if is_better:
+                best_val_metric = val_loss if self.task_type != 'clustering' else val_metric
                 best_epoch = epoch
                 patience_counter = 0
             else:
@@ -147,14 +227,21 @@ class HyperGRANDTrainer:
                 pbar.set_postfix({
                     'train_loss': f'{train_loss:.4f}',
                     'val_loss': f'{val_loss:.4f}',
-                    'val_acc': f'{val_acc:.4f}'
+                    'val_metric': f'{val_metric:.4f}'
                 })
         
         # Test
-        test_loss, test_acc = self.evaluate(data, num_classes, data.test_mask)
+        test_loss, test_metric = self.evaluate(data, data.test_mask)
+        
+        # For clustering, also compute NMI/ARI
+        if self.task_type == 'clustering':
+            cluster_metrics = self.evaluate_clustering(data, data.test_mask)
+            results['test_nmi'] = cluster_metrics['nmi']
+            results['test_ari'] = cluster_metrics['ari']
+        
         results['final_test_loss'] = test_loss
-        results['final_test_acc'] = test_acc
-        results['best_val_loss'] = best_val_loss
+        results['final_test_metric'] = test_metric
+        results['best_val_metric'] = best_val_metric
         results['best_epoch'] = best_epoch + 1
         
         return results
@@ -168,7 +255,7 @@ def train_dataset(
     patience: int = 50,
     verbose: bool = True
 ) -> Dict:
-    """Train model on a single dataset"""
+    """Train model on a single dataset with task-aware training"""
     
     if verbose:
         print(f"\n{'='*80}")
@@ -184,12 +271,18 @@ def train_dataset(
     input_dim = data.x.shape[1]
     num_nodes = data.num_nodes
     
+    # Infer task type from metadata
+    task_type = 'classification'  # default
+    if hasattr(data, 'metadata'):
+        task_type = data.metadata.task_type
+    
     if verbose:
         print(f"Dataset Info:")
         print(f"  Nodes: {num_nodes}")
         print(f"  Features: {input_dim}")
         print(f"  Classes: {num_classes}")
         print(f"  Hyperedges: {data.hyperedge_index.shape[1]}")
+        print(f"  Task Type: {task_type}")
         print(f"  Train: {data.train_mask.sum().item()} | Val: {data.val_mask.sum().item()} | Test: {data.test_mask.sum().item()}")
     
     # Create model
@@ -203,11 +296,19 @@ def train_dataset(
         scheme='explicit'
     )
     
+    # Create task-specific head
+    head = TaskAwareHead(hidden_dim, num_classes, task_type=task_type)
+    
     # Train
-    trainer = HyperGRANDTrainer(model, device=device, learning_rate=learning_rate)
+    trainer = HyperGRANDTrainer(
+        model=model,
+        head=head,
+        task_type=task_type,
+        device=device,
+        learning_rate=learning_rate
+    )
     results = trainer.train(
         data,
-        num_classes=num_classes,
         num_epochs=num_epochs,
         patience=patience,
         verbose=verbose
@@ -216,9 +317,18 @@ def train_dataset(
     if verbose:
         print(f"\nResults:")
         print(f"  Best Epoch: {results['best_epoch']}")
-        print(f"  Best Val Loss: {results['best_val_loss']:.4f}")
-        print(f"  Final Test Loss: {results['final_test_loss']:.4f}")
-        print(f"  Final Test Accuracy: {results['final_test_acc']:.4f}")
+        if task_type in ['classification', 'partitioning']:
+            print(f"  Best Val Loss: {results['best_val_metric']:.4f}")
+            print(f"  Final Test Loss: {results['final_test_loss']:.4f}")
+            print(f"  Final Test Accuracy: {results['final_test_metric']:.4f}")
+        elif task_type == 'clustering':
+            print(f"  Best Val Loss: {results['best_val_metric']:.4f}")
+            print(f"  Final Test NMI: {results.get('test_nmi', 0.0):.4f}")
+            print(f"  Final Test ARI: {results.get('test_ari', 0.0):.4f}")
+    
+    results['dataset_name'] = dataset_name
+    results['num_nodes'] = num_nodes
+    results['num_classes'] = num_classes
     
     return results
 
@@ -269,39 +379,68 @@ def train_all_datasets(
 
 def print_summary(results: Dict):
     """Print summary of training results"""
-    print(f"\n{'='*80}")
+    print(f"\n{'='*100}")
     print("TRAINING SUMMARY")
-    print(f"{'='*80}\n")
+    print(f"{'='*100}\n")
     
-    successful = 0
-    failed = 0
-    
+    # Group by task type
+    by_task = {}
     for dataset_name, result in sorted(results.items()):
         if 'error' in result:
-            print(f"✗ {dataset_name:<30} | ERROR: {result['error'][:50]}")
-            failed += 1
+            task_type = 'unknown'
         else:
-            test_acc = result['final_test_acc']
+            task_type = result.get('task_type', 'classification')
+        
+        if task_type not in by_task:
+            by_task[task_type] = {'success': 0, 'failed': 0, 'results': []}
+        
+        if 'error' in result:
+            print(f"✗ {dataset_name:<30} | ERROR: {result['error'][:50]}")
+            by_task[task_type]['failed'] += 1
+        else:
+            by_task[task_type]['success'] += 1
+            metric_val = result.get('final_test_metric', 0.0)
             test_loss = result['final_test_loss']
-            print(f"✓ {dataset_name:<30} | Test Acc: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
-            successful += 1
+            
+            if task_type == 'clustering':
+                nmi = result.get('test_nmi', 0.0)
+                ari = result.get('test_ari', 0.0)
+                print(f"✓ {dataset_name:<30} | NMI: {nmi:.4f} | ARI: {ari:.4f} | Loss: {test_loss:.4f}")
+            else:
+                print(f"✓ {dataset_name:<30} | Acc: {metric_val:.4f} | Loss: {test_loss:.4f}")
+            
+            by_task[task_type]['results'].append((dataset_name, metric_val, test_loss))
     
-    print(f"\n{'='*80}")
-    print(f"RESULTS: {successful} successful, {failed} failed")
-    print(f"{'='*80}\n")
+    print(f"\n{'='*100}")
+    print("SUMMARY BY TASK TYPE")
+    print(f"{'='*100}")
+    for task_type, stats in sorted(by_task.items()):
+        print(f"\n{task_type.upper()}:")
+        print(f"  Successful: {stats['success']} | Failed: {stats['failed']}")
+        if stats['results']:
+            accs = [m for _, m, _ in stats['results']]
+            print(f"  Mean Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+    
+    total_success = sum(s['success'] for s in by_task.values())
+    total_failed = sum(s['failed'] for s in by_task.values())
+    print(f"\n{'='*100}")
+    print(f"TOTAL: {total_success} successful, {total_failed} failed")
+    print(f"{'='*100}\n")
 
 
 def main():
     """Main training script"""
     import argparse
+    import json
     
-    parser = argparse.ArgumentParser(description='Train HyperGRAND on datasets')
+    parser = argparse.ArgumentParser(description='Train HyperGRAND on datasets with task awareness')
     parser.add_argument('--dataset', type=str, default=None, help='Single dataset to train on')
     parser.add_argument('--hidden-dim', type=int, default=32, help='Hidden dimension')
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate')
     parser.add_argument('--patience', type=int, default=50, help='Early stopping patience')
     parser.add_argument('--all', action='store_true', help='Train on all datasets')
+    parser.add_argument('--save-results', type=str, default=None, help='Save results to JSON file')
     
     args = parser.parse_args()
     
@@ -323,6 +462,11 @@ def main():
             patience=args.patience
         )
         print_summary(results)
+        
+        if args.save_results:
+            with open(args.save_results, 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"Results saved to {args.save_results}")
     else:
         # Train on a few representative datasets
         representative_datasets = [

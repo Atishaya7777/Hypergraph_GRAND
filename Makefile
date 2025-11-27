@@ -15,28 +15,34 @@ YELLOW = \033[1;33m
 RED = \033[0;31m
 NC = \033[0m # No Color
 
-.PHONY: default help venv install run mlflow clean
+.PHONY: default help venv install test train train-representative train-all mlflow clean
 
 default: help
 
 help:
-	@echo "$(BLUE)HypergraphGRAND Project Makefile$(NC)"
-	@echo "============================================="
+	@echo "$(BLUE)HyperGRAND Project Makefile$(NC)"
+	@echo "=============================================="
 	@echo ""
-	@echo "$(GREEN) Setup Commands:$(NC)"
-	@echo "  make venv        - Create virtual environment"
-	@echo "  make install     - Install Python dependencies"
+	@echo "$(GREEN)Setup Commands:$(NC)"
+	@echo "  make venv              - Create virtual environment"
+	@echo "  make install           - Install Python dependencies"
 	@echo ""
-	@echo "$(GREEN) Run Commands:$(NC)"
-	@echo "  make run         - Run main.py with default parameters"
-	@echo "  make run ARGS=\"...\" - Run main.py with custom arguments"
-	@echo "                      Example: make run ARGS=\"--dataset planetoid_cora --strategy classification\""
+	@echo "$(GREEN)Testing & Validation:$(NC)"
+	@echo "  make test              - Validate dataset structure (no training)"
 	@echo ""
-	@echo "$(GREEN) MLflow Commands:$(NC)"
-	@echo "  make mlflow      - Start MLflow UI server (http://localhost:5000)"
+	@echo "$(GREEN)Training Commands:$(NC)"
+	@echo "  make train             - Train on single dataset"
+	@echo "                          Usage: make train DATASET=cora"
+	@echo "  make train-representative - Train on 3 representative datasets"
+	@echo "                          (cora, contact_high_school, zoo)"
+	@echo "  make train-all         - Train on all 16 datasets (with resume capability)"
+	@echo "                          Usage: make train-all [EPOCHS=200] [PATIENCE=50]"
 	@echo ""
-	@echo "$(GREEN) Maintenance Commands:$(NC)"
-	@echo "  make clean       - Clean generated files and cache"
+	@echo "$(GREEN)MLflow Commands:$(NC)"
+	@echo "  make mlflow            - Start MLflow UI server (http://localhost:5000)"
+	@echo ""
+	@echo "$(GREEN)Maintenance Commands:$(NC)"
+	@echo "  make clean             - Clean generated files and cache"
 
 venv:
 	@echo "$(BLUE) Creating virtual environment...$(NC)"
@@ -57,15 +63,29 @@ install: venv
 		echo "$(YELLOW)⚠️  requirements.txt not found$(NC)"; \
 	fi
 
-run: venv install
-	@echo "$(BLUE) Running HypergraphGRAND...$(NC)"
-	@if [ -z "$(ARGS)" ]; then \
-		$(PYTHON_VENV) $(MAIN_FILE) --help; \
-		echo ""; \
-		echo "$(YELLOW)Run with custom arguments: make run ARGS=\"--dataset planetoid_cora --strategy classification\"$(NC)"; \
-	else \
-		$(PYTHON_VENV) $(MAIN_FILE) $(ARGS); \
+test: venv install
+	@echo "$(BLUE) Running dataset structure validation...$(NC)"
+	@$(PYTHON_VENV) $(MAIN_FILE) --mode test
+
+train: venv install
+	@if [ -z "$(DATASET)" ]; then \
+		echo "$(RED)Error: DATASET not specified$(NC)"; \
+		echo "Usage: make train DATASET=cora"; \
+		exit 1; \
 	fi
+	@echo "$(BLUE) Training on dataset: $(DATASET)...$(NC)"
+	@$(PYTHON_VENV) $(MAIN_FILE) --mode train --dataset $(DATASET) --epochs 200 --patience 50
+
+train-representative: venv install
+	@echo "$(BLUE) Training on representative datasets...$(NC)"
+	@echo "$(YELLOW) This trains: cora (classification), contact_high_school (clustering), zoo (partitioning)$(NC)"
+	@$(PYTHON_VENV) $(MAIN_FILE) --mode train --epochs 200 --patience 50
+
+train-all: venv install
+	@echo "$(BLUE) Training on ALL 16 datasets...$(NC)"
+	@echo "$(YELLOW) This may take a while. Training will resume from saved progress if interrupted.$(NC)"
+	@$(PYTHON_VENV) $(MAIN_FILE) --mode batch --epochs $(EPOCHS) --patience $(PATIENCE) --save-results training_results.json
+	@echo "$(GREEN)✓ Training complete. Results saved to training_results.json$(NC)"
 
 mlflow: venv install
 	@echo "$(BLUE) Starting MLflow UI server...$(NC)"
