@@ -1,0 +1,25 @@
+# High Accuracy Configuration
+# Use this for best performance with larger models and more training
+
+mode: train
+dataset: null
+
+# Larger model
+hidden-dim: 64
+num-layers: 4
+alpha: 0.1
+dropout: 0.2
+scheme: explicit
+
+# Long training with patience
+epochs: 500
+patience: 100
+lr: 0.005
+weight-decay: 0.0001
+
+mlflow-experiment: HyperGRAND-HighAccuracy
+no-mlflow: false
+
+output: results_highaccuracy.json
+verbose: true
+seed: 42

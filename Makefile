@@ -1,6 +1,3 @@
-# HypergraphGRAND Makefile
-# Essential commands for environment setup and running experiments
-
 VENV_NAME = venv
 PYTHON = python3
 PIP = $(VENV_NAME)/bin/pip
@@ -8,14 +5,19 @@ PYTHON_VENV = $(VENV_NAME)/bin/python
 MAIN_FILE = main.py
 REQUIREMENTS_FILE = requirements.txt
 
-# Color codes for output
+# Default parameters
+EPOCHS ?= 200
+PATIENCE ?= 50
+DIMENSION ?= all
+SEEDS ?= 5
+
 BLUE = \033[0;34m
 GREEN = \033[0;32m
 YELLOW = \033[1;33m
 RED = \033[0;31m
-NC = \033[0m # No Color
+NC = \033[0m 
 
-.PHONY: default help venv install test train train-representative train-all mlflow clean
+.PHONY: default help venv install test train train-representative train-all diffusion-study diffusion-fast analyze mlflow clean
 
 default: help
 
@@ -37,6 +39,12 @@ help:
 	@echo "                          (cora, contact_high_school, zoo)"
 	@echo "  make train-all         - Train on all 16 datasets (with resume capability)"
 	@echo "                          Usage: make train-all [EPOCHS=200] [PATIENCE=50]"
+	@echo ""
+	@echo "$(GREEN)Diffusion Study Commands:$(NC)"
+	@echo "  make diffusion-fast    - Quick hypothesis validation (3 datasets, ~4 hours)"
+	@echo "  make diffusion-study   - Full diffusion parameter studies (all datasets)"
+	@echo "                          Usage: make diffusion-study [DIMENSION=all] [SEEDS=5]"
+	@echo "  make analyze           - Generate reports and visualizations from MLflow"
 	@echo ""
 	@echo "$(GREEN)MLflow Commands:$(NC)"
 	@echo "  make mlflow            - Start MLflow UI server (http://localhost:5000)"
@@ -87,6 +95,24 @@ train-all: venv install
 	@$(PYTHON_VENV) $(MAIN_FILE) --mode batch --epochs $(EPOCHS) --patience $(PATIENCE) --save-results training_results.json
 	@echo "$(GREEN)  Training complete. Results saved to training_results.json$(NC)"
 
+diffusion-fast: venv install
+	@echo "$(BLUE) Running fast diffusion study (representative datasets only)...$(NC)"
+	@echo "$(YELLOW) This tests 3 datasets with reduced configs (~50 experiments, ~4 hours)$(NC)"
+	@$(PYTHON_VENV) $(MAIN_FILE) --mode diffusion-study --fast-mode --representative-only --num-seeds 3 --output diffusion_fast_results.json
+	@echo "$(GREEN)  Fast study complete. Results saved to diffusion_fast_results.json$(NC)"
+
+diffusion-study: venv install
+	@echo "$(BLUE) Running full diffusion parameter studies...$(NC)"
+	@echo "$(YELLOW) This may take 20-40 hours depending on hardware$(NC)"
+	@$(PYTHON_VENV) $(MAIN_FILE) --mode diffusion-study --study-dimension $(DIMENSION) --num-seeds $(SEEDS) --output diffusion_study_results.json
+	@echo "$(GREEN)  Diffusion study complete. Results saved to diffusion_study_results.json$(NC)"
+
+analyze: venv install
+	@echo "$(BLUE) Generating analysis reports and visualizations...$(NC)"
+	@mkdir -p analysis_output
+	@$(PYTHON_VENV) experiments/analyze_diffusion_results.py --generate-report --generate-latex --plot-heatmap --output-dir analysis_output
+	@echo "$(GREEN)  Analysis complete. See analysis_output/ directory$(NC)"
+
 mlflow: venv install
 	@echo "$(BLUE) Starting MLflow UI server...$(NC)"
 	@echo "$(YELLOW) MLflow UI available at: http://localhost:5000$(NC)"
@@ -99,4 +125,5 @@ clean:
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@find . -name "*.png" -type f -delete 2>/dev/null || true
 	@rm -rf .pytest_cache 2>/dev/null || true
+	@rm -rf analysis_output 2>/dev/null || true
 	@echo "$(GREEN)  Cleaned generated files and cache$(NC)"

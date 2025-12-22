@@ -1,0 +1,36 @@
+# HyperGRAND Default Configuration
+# This file shows all available hyperparameters and their default values.
+# You can modify these values and pass the config file via: python main.py --config configs/default.yaml
+
+# Training Mode
+mode: train                    # Options: train, batch, validate, test
+
+# Dataset Selection
+dataset: null                  # Dataset name (e.g., "cora", "news_20w100", "zoo")
+datasets: null                 # Multiple datasets as list: [cora, citeseer]
+
+# Model Architecture
+hidden-dim: 32                 # Hidden dimension of the model
+num-layers: 3                  # Number of layers in the model
+alpha: 0.1                     # Diffusion parameter alpha
+dropout: 0.1                   # Dropout rate
+scheme: explicit               # Integration scheme: explicit, implicit, multistep, adaptive
+
+# Training Parameters
+epochs: 200                    # Maximum number of training epochs
+patience: 50                   # Early stopping patience
+lr: 0.01                       # Learning rate
+weight-decay: 0.00001          # Weight decay for optimizer (L2 regularization)
+
+# MLflow Configuration
+mlflow-experiment: HyperGRAND  # MLflow experiment name
+mlflow-tracking-uri: http://localhost:5000  # MLflow tracking server URI
+no-mlflow: false               # Disable MLflow logging if true
+
+# Output and Logging
+output: hypergrand_results.json # Output JSON file for results
+save-results: null             # Save training results to JSON file (batch mode)
+verbose: true                  # Verbose output during training
+
+# Reproducibility
+seed: 42                       # Random seed for reproducibility

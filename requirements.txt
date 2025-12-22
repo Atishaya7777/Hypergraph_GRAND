@@ -12,4 +12,4 @@ numpy
 typing_extensions
 seaborn
 numba
-pandas
+pyyaml

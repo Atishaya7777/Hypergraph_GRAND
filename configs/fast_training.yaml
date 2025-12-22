@@ -1,0 +1,25 @@
+# Fast Training Configuration
+# Use this for quick testing with fewer epochs and smaller models
+
+mode: train
+dataset: null
+
+# Smaller model
+hidden-dim: 16
+num-layers: 2
+alpha: 0.1
+dropout: 0.05
+scheme: explicit
+
+# Fast training
+epochs: 50
+patience: 10
+lr: 0.01
+weight-decay: 0.00001
+
+mlflow-experiment: HyperGRAND-Fast
+no-mlflow: false
+
+output: results_fast.json
+verbose: true
+seed: 42

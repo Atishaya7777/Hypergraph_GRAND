@@ -8,6 +8,7 @@ Supports classification, clustering, and partitioning tasks.
 
 import argparse
 import json
+import yaml
 import torch
 import numpy as np
 from typing import Dict, List
@@ -25,6 +26,25 @@ sys.path.insert(0, str(Path(__file__).parent))
 from train_model import train_dataset, train_all_datasets
 
 
+def load_config_file(config_path: str) -> Dict:
+    """Load hyperparameters from YAML or JSON config file."""
+    config_path = Path(config_path)
+    
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    if config_path.suffix in ['.yaml', '.yml']:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+    elif config_path.suffix == '.json':
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    else:
+        raise ValueError(f"Unsupported config file format: {config_path.suffix}. Use .yaml, .yml, or .json")
+    
+    return config or {}
+
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -32,13 +52,21 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Config file support
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Load hyperparameters from YAML or JSON config file. CLI args override config values.",
+    )
+
     # Mode selection
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["test", "train", "validate", "batch"],
+        choices=["test", "train", "validate", "batch", "diffusion-study"],
         default="train",
-        help="Mode: test (structure validation), train (training), validate (full validation), batch (train all datasets)",
+        help="Mode: test (structure validation), train (training), validate (full validation), batch (train all datasets), diffusion-study (run parameter studies)",
     )
 
     # Dataset selection
@@ -131,7 +159,55 @@ def parse_args():
         "--seed", type=int, default=42, help="Random seed for reproducibility"
     )
 
-    return parser.parse_args()
+    # Diffusion study parameters
+    parser.add_argument(
+        "--study-dimension",
+        type=str,
+        nargs="+",
+        choices=["integration_scheme", "diffusion_depth", "attention_mechanism", "all"],
+        default=["all"],
+        help="Study dimensions to explore (for diffusion-study mode)",
+    )
+    parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=5,
+        help="Number of random seeds per configuration (for diffusion-study mode)",
+    )
+    parser.add_argument(
+        "--representative-only",
+        action="store_true",
+        help="Use only representative datasets (for diffusion-study mode)",
+    )
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: auto-detect, for diffusion-study mode)",
+    )
+    parser.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="Use reduced configuration set for fast validation (for diffusion-study mode)",
+    )
+
+    # Parse arguments
+    args = parser.parse_args()
+    
+    # Load config file if provided and merge with CLI arguments
+    if args.config:
+        config = load_config_file(args.config)
+        
+        # Convert config keys with dashes to underscores (e.g., 'hidden-dim' -> 'hidden_dim')
+        config = {k.replace('-', '_'): v for k, v in config.items()}
+        
+        # Merge config with CLI args (CLI args take precedence)
+        for key, value in config.items():
+            if hasattr(args, key) and getattr(args, key) == parser.get_default(key):
+                # Only override if the current value is the default
+                setattr(args, key, value)
+    
+    return args
 
 
 
@@ -166,26 +242,118 @@ def validate_dataset(loader, dataset_name: str, task_type: str) -> Dict:
 
 
 class MLFlowLogger:
-    """Wrapper for MLflow logging with task-aware metrics"""
+    """Enhanced MLflow logger with nested run support and comprehensive tracking"""
     
     def __init__(self, enabled: bool = True, experiment_name: str = "HyperGRAND", tracking_uri: str = None):
         self.enabled = enabled and MLFLOW_AVAILABLE
+        self.current_run_id = None
+        self.parent_run_id = None
+        
         if self.enabled:
             if tracking_uri:
                 mlflow.set_tracking_uri(tracking_uri)
             mlflow.set_experiment(experiment_name)
     
-    def start_run(self, dataset_name: str, task_type: str, params: Dict):
+    def start_run(self, dataset_name: str, task_type: str, params: Dict, tags: Dict = None):
         """Start MLflow run"""
         if not self.enabled:
-            return
+            return None
         
-        mlflow.start_run(run_name=f"{dataset_name}_{task_type}")
+        run = mlflow.start_run(run_name=f"{dataset_name}_{task_type}")
+        self.current_run_id = run.info.run_id
+        
+        # Log parameters
         mlflow.log_params({
             'dataset': dataset_name,
             'task_type': task_type,
             **{f'param_{k}': v for k, v in params.items()}
         })
+        
+        # Log tags
+        if tags:
+            mlflow.set_tags(tags)
+        
+        # Log system info
+        import platform
+        mlflow.log_param('python_version', platform.python_version())
+        mlflow.log_param('pytorch_version', torch.__version__)
+        if torch.cuda.is_available():
+            mlflow.log_param('cuda_version', torch.version.cuda)
+            mlflow.log_param('gpu_name', torch.cuda.get_device_name(0))
+        
+        return self.current_run_id
+    
+    def start_parent_run(self, study_name: str, study_dimension: str, params: Dict = None, tags: Dict = None):
+        """Start a parent run for a diffusion study"""
+        if not self.enabled:
+            return None
+        
+        run = mlflow.start_run(run_name=f"study_{study_dimension}_{study_name}")
+        self.parent_run_id = run.info.run_id
+        self.current_run_id = self.parent_run_id
+        
+        # Log study metadata
+        mlflow.log_param('study_name', study_name)
+        mlflow.log_param('study_dimension', study_dimension)
+        mlflow.set_tag('run_type', 'parent')
+        mlflow.set_tag('study_dimension', study_dimension)
+        
+        if params:
+            mlflow.log_params(params)
+        
+        if tags:
+            mlflow.set_tags(tags)
+        
+        return self.parent_run_id
+    
+    def start_child_run(self, dataset_name: str, config_variant: str, seed: int, 
+                       params: Dict, tags: Dict = None):
+        """Start a child run nested under current parent run"""
+        if not self.enabled or not self.parent_run_id:
+            return None
+        
+        # End parent run context temporarily
+        mlflow.end_run()
+        
+        # Start nested run
+        run = mlflow.start_run(
+            run_name=f"{dataset_name}_{config_variant}_seed{seed}",
+            nested=True
+        )
+        self.current_run_id = run.info.run_id
+        
+        # Log parameters
+        mlflow.log_params({
+            'dataset': dataset_name,
+            'config_variant': config_variant,
+            'seed': seed,
+            'parent_run_id': self.parent_run_id,
+            **params
+        })
+        
+        # Log tags
+        default_tags = {
+            'run_type': 'child',
+            'config_variant': config_variant,
+            'seed': str(seed),
+        }
+        if tags:
+            default_tags.update(tags)
+        mlflow.set_tags(default_tags)
+        
+        return self.current_run_id
+    
+    def end_child_run(self):
+        """End child run and reopen parent"""
+        if not self.enabled:
+            return
+        
+        mlflow.end_run()
+        
+        # Reopen parent run
+        if self.parent_run_id:
+            mlflow.start_run(run_id=self.parent_run_id)
+            self.current_run_id = self.parent_run_id
     
     def log_metrics(self, metrics: Dict, step: int = None):
         """Log metrics to MLflow"""
@@ -195,6 +363,27 @@ class MLFlowLogger:
         for key, value in metrics.items():
             if isinstance(value, (int, float)):
                 mlflow.log_metric(key, value, step=step)
+    
+    def log_params(self, params: Dict):
+        """Log parameters to MLflow"""
+        if not self.enabled:
+            return
+        
+        mlflow.log_params(params)
+    
+    def log_tags(self, tags: Dict):
+        """Log tags to MLflow"""
+        if not self.enabled:
+            return
+        
+        mlflow.set_tags(tags)
+    
+    def log_artifact(self, artifact_path: str):
+        """Log artifact file to MLflow"""
+        if not self.enabled:
+            return
+        
+        mlflow.log_artifact(artifact_path)
     
     def log_result(self, result: Dict):
         """Log full training result"""
@@ -222,10 +411,122 @@ class MLFlowLogger:
         for i, metric in enumerate(result.get('val_metrics', [])):
             mlflow.log_metric('val_metric', metric, step=i)
     
+    def aggregate_child_runs(self, metric_names: List[str] = None):
+        """
+        Aggregate metrics from child runs and log to parent run
+        Computes mean, std, and 95% confidence intervals
+        """
+        if not self.enabled or not self.parent_run_id:
+            return
+        
+        try:
+            from scipy import stats
+            from mlflow.tracking import MlflowClient
+            
+            client = MlflowClient()
+            
+            # Get all child runs
+            parent_run = client.get_run(self.parent_run_id)
+            child_runs = client.search_runs(
+                experiment_ids=[parent_run.info.experiment_id],
+                filter_string=f"tags.parent_run_id = '{self.parent_run_id}'"
+            )
+            
+            if not child_runs:
+                return
+            
+            # Determine metrics to aggregate
+            if metric_names is None:
+                # Auto-detect from first child run
+                first_child = child_runs[0]
+                metric_names = list(first_child.data.metrics.keys())
+            
+            # Aggregate each metric
+            for metric_name in metric_names:
+                values = []
+                for run in child_runs:
+                    if metric_name in run.data.metrics:
+                        values.append(run.data.metrics[metric_name])
+                
+                if values:
+                    mean_val = np.mean(values)
+                    std_val = np.std(values)
+                    
+                    # Compute 95% confidence interval
+                    if len(values) > 1:
+                        ci = stats.t.interval(0.95, len(values)-1, 
+                                            loc=mean_val, 
+                                            scale=stats.sem(values))
+                        ci_lower, ci_upper = ci
+                    else:
+                        ci_lower, ci_upper = mean_val, mean_val
+                    
+                    # Log aggregated metrics to parent
+                    mlflow.log_metric(f"{metric_name}_mean", mean_val)
+                    mlflow.log_metric(f"{metric_name}_std", std_val)
+                    mlflow.log_metric(f"{metric_name}_ci_lower", ci_lower)
+                    mlflow.log_metric(f"{metric_name}_ci_upper", ci_upper)
+                    mlflow.log_metric(f"{metric_name}_min", min(values))
+                    mlflow.log_metric(f"{metric_name}_max", max(values))
+        
+        except Exception as e:
+            print(f"Warning: Failed to aggregate child runs: {e}")
+    
+    def compare_with_baseline(self, baseline_run_id: str, metric_name: str = 'final_test_accuracy'):
+        """
+        Compare current parent run with baseline using paired t-test
+        Logs p-value and significance to parent run
+        """
+        if not self.enabled or not self.parent_run_id:
+            return
+        
+        try:
+            from scipy import stats
+            from mlflow.tracking import MlflowClient
+            
+            client = MlflowClient()
+            
+            # Get child runs for both parent and baseline
+            def get_child_metrics(parent_id):
+                parent_run = client.get_run(parent_id)
+                child_runs = client.search_runs(
+                    experiment_ids=[parent_run.info.experiment_id],
+                    filter_string=f"tags.parent_run_id = '{parent_id}'"
+                )
+                return [run.data.metrics.get(metric_name) 
+                       for run in child_runs 
+                       if metric_name in run.data.metrics]
+            
+            current_values = get_child_metrics(self.parent_run_id)
+            baseline_values = get_child_metrics(baseline_run_id)
+            
+            if len(current_values) > 1 and len(baseline_values) > 1:
+                # Paired t-test
+                t_stat, p_value = stats.ttest_rel(current_values, baseline_values)
+                
+                # Log results
+                mlflow.log_metric('t_statistic', t_stat)
+                mlflow.log_metric('p_value', p_value)
+                mlflow.log_metric('is_significant', 1.0 if p_value < 0.05 else 0.0)
+                
+                # Tag based on significance
+                if p_value < 0.05:
+                    if np.mean(current_values) > np.mean(baseline_values):
+                        mlflow.set_tag('comparison_result', 'significant_improvement')
+                    else:
+                        mlflow.set_tag('comparison_result', 'significant_degradation')
+                else:
+                    mlflow.set_tag('comparison_result', 'no_significant_difference')
+        
+        except Exception as e:
+            print(f"Warning: Failed to compare with baseline: {e}")
+    
     def end_run(self):
         """End MLflow run"""
         if self.enabled:
             mlflow.end_run()
+            self.current_run_id = None
+            self.parent_run_id = None
 
 
 def run_validation_mode(args):
@@ -431,6 +732,51 @@ def run_batch_mode(args):
     return results
 
 
+def run_diffusion_study_mode(args):
+    """Run systematic diffusion parameter studies with MLflow tracking"""
+    print(f"\n{'='*100}")
+    print("DIFFUSION PARAMETER STUDIES")
+    print(f"{'='*100}\n")
+    
+    from experiments.run_diffusion_studies import DiffusionStudyRunner
+    
+    # Create MLflow logger
+    mlflow_logger = MLFlowLogger(
+        enabled=not args.no_mlflow,
+        experiment_name="HyperGRAND_Diffusion_Studies",
+        tracking_uri=args.mlflow_tracking_uri if hasattr(args, 'mlflow_tracking_uri') else None
+    )
+    
+    # Handle "all" dimension
+    if 'all' in args.study_dimension:
+        study_dimensions = ['integration_scheme', 'diffusion_depth', 'attention_mechanism']
+    else:
+        study_dimensions = args.study_dimension
+    
+    # Create runner
+    runner = DiffusionStudyRunner(
+        study_dimensions=study_dimensions,
+        datasets=args.datasets,
+        num_seeds=args.num_seeds,
+        parallel_workers=args.parallel_workers,
+        fast_mode=args.fast_mode,
+        representative_only=args.representative_only,
+        mlflow_logger=mlflow_logger if not args.no_mlflow else None
+    )
+    
+    # Run studies
+    results = runner.run()
+    
+    # Save results
+    if args.output:
+        import json
+        with open(args.output, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        print(f"\nResults saved to {args.output}")
+    
+    return results
+
+
 def main():
     """Unified main entry point for all testing and training modes."""
     args = parse_args()
@@ -511,6 +857,22 @@ def main():
                         nmi = result.get('test_nmi', 0.0)
                         ari = result.get('test_ari', 0.0)
                         print(f"{dataset_name} ({task_type}): Best Epoch={best_epoch}, Test NMI={nmi:.4f}, Test ARI={ari:.4f}, Test Loss={test_loss:.4f}")
+            print(f"{'='*100}\n")
+        
+        elif args.mode == 'diffusion-study':
+            # Run diffusion parameter studies
+            results = run_diffusion_study_mode(args)
+            
+            # Print summary
+            print(f"\n{'='*100}")
+            print("DIFFUSION STUDY SUMMARY")
+            print(f"{'='*100}")
+            for study_dim, dim_results in results.items():
+                successful = sum(1 for r in dim_results if r['success'])
+                failed = sum(1 for r in dim_results if not r['success'])
+                print(f"\n{study_dim}:")
+                print(f"  Successful: {successful}/{len(dim_results)}")
+                print(f"  Failed: {failed}/{len(dim_results)}")
             print(f"{'='*100}\n")
         
         else:

@@ -1,0 +1,25 @@
+# HyperGRAND Diffusion Study Configuration
+# Example configuration for classification tasks
+
+# Model architecture
+hidden_dim: 64
+num_layers: 3
+alpha: 0.05
+dropout: 0.3
+
+# Integration scheme: explicit, implicit, adaptive
+integration_scheme: implicit
+
+# Attention mechanism
+use_attention: true
+attention_type: full
+
+# Training parameters
+epochs: 300
+patience: 50
+lr: 0.01
+weight_decay: 0.0005
+
+# Study metadata
+study_dimension: baseline
+config_variant: baseline_classification

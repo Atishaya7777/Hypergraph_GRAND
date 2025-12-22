@@ -32,10 +32,19 @@ Or with results saved to file:
 python main.py --mode batch --output results.json
 ```
 
-Resume training from checkpoint:
+## Run Diffusion Studies
+
+Systematic parameter studies with statistical analysis:
 
 ```bash
-python main.py --mode batch --output results.json --save-results
+# Fast mode: Representative datasets (cora, contact_high_school, zoo) with reduced configs
+python main.py --mode diffusion-study --fast-mode --representative-only --num-seeds 3
+
+# Full study: All integration schemes
+python main.py --mode diffusion-study --study-dimension integration_scheme --num-seeds 5
+
+# All study dimensions
+python main.py --mode diffusion-study --study-dimension all --num-seeds 5
 ```
 
 ## View Results
@@ -53,3 +62,11 @@ mlflow ui
 ```
 
 Then navigate to `http://localhost:5000`
+
+## Analyze Study Results
+
+Generate comprehensive reports and visualizations:
+
+```bash
+python experiments/analyze_diffusion_results.py --generate-report --generate-latex --plot-heatmap
+```

@@ -253,13 +253,41 @@ def train_dataset(
     num_epochs: int = 200,
     learning_rate: float = 0.01,
     patience: int = 50,
-    verbose: bool = True
+    verbose: bool = True,
+    seed: int = None,
+    mlflow_logger = None,
+    parent_run_id: str = None,
+    config: Dict = None
 ) -> Dict:
-    """Train model on a single dataset with task-aware training"""
+    """
+    Train model on a single dataset with task-aware training
+    
+    Args:
+        dataset_name: Name of dataset to train on
+        hidden_dim: Hidden dimension for model
+        num_epochs: Maximum training epochs
+        learning_rate: Learning rate
+        patience: Early stopping patience
+        verbose: Print training progress
+        seed: Random seed for reproducibility
+        mlflow_logger: MLFlowLogger instance for logging
+        parent_run_id: Parent run ID for nested MLflow runs
+        config: Additional configuration dict (for diffusion studies)
+    
+    Returns:
+        Dictionary with training results
+    """
+    
+    # Set random seed if provided
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     
     if verbose:
         print(f"\n{'='*80}")
-        print(f"Training on {dataset_name}")
+        print(f"Training on {dataset_name}" + (f" (seed={seed})" if seed is not None else ""))
         print(f"{'='*80}")
     
     # Load dataset
@@ -285,19 +313,59 @@ def train_dataset(
         print(f"  Task Type: {task_type}")
         print(f"  Train: {data.train_mask.sum().item()} | Val: {data.val_mask.sum().item()} | Test: {data.test_mask.sum().item()}")
     
+    # Apply config if provided (for diffusion studies)
+    if config:
+        hidden_dim = config.get('hidden_dim', hidden_dim)
+        num_layers = config.get('num_layers', 3)
+        alpha = config.get('alpha', 0.1)
+        dropout = config.get('dropout', 0.1)
+        scheme = config.get('integration_scheme', 'explicit')
+        learning_rate = config.get('lr', learning_rate)
+        num_epochs = config.get('epochs', num_epochs)
+        patience = config.get('patience', patience)
+    else:
+        num_layers = 3
+        alpha = 0.1
+        dropout = 0.1
+        scheme = 'explicit'
+    
     # Create model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = create_hypergrand_model(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
-        num_layers=3,
-        alpha=0.1,
-        dropout=0.1,
-        scheme='explicit'
+        num_layers=num_layers,
+        alpha=alpha,
+        dropout=dropout,
+        scheme=scheme
     )
     
     # Create task-specific head
     head = TaskAwareHead(hidden_dim, num_classes, task_type=task_type)
+    
+    # Start nested MLflow run if logger provided
+    if mlflow_logger and parent_run_id:
+        config_variant = config.get('config_variant', 'default') if config else 'default'
+        mlflow_logger.start_child_run(
+            dataset_name=dataset_name,
+            config_variant=config_variant,
+            seed=seed if seed is not None else 42,
+            params={
+                'hidden_dim': hidden_dim,
+                'num_layers': num_layers,
+                'alpha': alpha,
+                'dropout': dropout,
+                'integration_scheme': scheme,
+                'learning_rate': learning_rate,
+                'epochs': num_epochs,
+                'patience': patience,
+                'num_nodes': num_nodes,
+                'num_features': input_dim,
+                'num_classes': num_classes,
+                'num_hyperedges': data.hyperedge_index.shape[1],
+            },
+            tags={'task_type': task_type, 'dataset': dataset_name}
+        )
     
     # Train
     trainer = HyperGRANDTrainer(
@@ -314,6 +382,12 @@ def train_dataset(
         verbose=verbose
     )
     
+    # Log results to MLflow if logger provided
+    if mlflow_logger:
+        mlflow_logger.log_result(results)
+        if parent_run_id:
+            mlflow_logger.end_child_run()
+    
     if verbose:
         print(f"\nResults:")
         print(f"  Best Epoch: {results['best_epoch']}")
@@ -327,8 +401,12 @@ def train_dataset(
             print(f"  Final Test ARI: {results.get('test_ari', 0.0):.4f}")
     
     results['dataset_name'] = dataset_name
+    results['task_type'] = task_type
     results['num_nodes'] = num_nodes
     results['num_classes'] = num_classes
+    results['seed'] = seed if seed is not None else 42
+    if config:
+        results['config'] = config
     
     return results
 
