@@ -1,6 +1,6 @@
 VENV_NAME = venv
 PYTHON = python3
-PIP = $(VENV_NAME)/bin/pip
+PIP = uv pip
 PYTHON_VENV = $(VENV_NAME)/bin/python
 MAIN_FILE = main.py
 REQUIREMENTS_FILE = requirements.txt
@@ -55,7 +55,7 @@ help:
 venv:
 	@echo "$(BLUE) Creating virtual environment...$(NC)"
 	@if [ ! -d "$(VENV_NAME)" ]; then \
-		$(PYTHON) -m venv $(VENV_NAME); \
+		uv venv $(VENV_NAME); \
 		echo "$(GREEN)  Virtual environment created$(NC)"; \
 	else \
 		echo "$(YELLOW)   Virtual environment already exists$(NC)"; \
@@ -63,7 +63,6 @@ venv:
 
 install: venv 
 	@echo "$(BLUE) Installing Python dependencies...$(NC)"
-	@$(PIP) install --upgrade pip
 	@if [ -f "$(REQUIREMENTS_FILE)" ]; then \
 		$(PIP) install -r $(REQUIREMENTS_FILE); \
 		echo "$(GREEN)  Dependencies installed from requirements.txt$(NC)"; \

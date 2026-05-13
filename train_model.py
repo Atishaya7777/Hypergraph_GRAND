@@ -8,6 +8,7 @@ Supports task-aware training: classification, clustering, partitioning
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
 from typing import Dict, Tuple, Optional
@@ -21,6 +22,32 @@ sys.path.insert(0, str(Path(__file__).parent))
 from data.pyg_standardizer import DatasetLoader
 from models.hypergrand import create_hypergrand_model
 from torch_geometric.data import Data
+
+
+class FocalLoss(nn.Module):
+    """Focal loss for class imbalance (Lin et al. ICCV 2017).
+
+    Down-weights easy (high-confidence correct) examples so the model
+    focuses on hard ones near the decision boundary:
+        FL(p_t) = -(1 - p_t)^gamma * log(p_t)
+
+    gamma=0 recovers standard cross-entropy. gamma=2 is standard default.
+    """
+
+    def __init__(self, gamma: float = 2.0, reduction: str = 'mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, reduction='none')
+        p_t = torch.exp(-ce)
+        loss = (1 - p_t) ** self.gamma * ce
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 
 class TaskAwareHead(nn.Module):
@@ -56,7 +83,9 @@ class HyperGRANDTrainer:
         task_type: str = 'classification',
         device: torch.device = None,
         learning_rate: float = 0.01,
-        weight_decay: float = 1e-5
+        weight_decay: float = 1e-5,
+        label_smoothing: float = 0.1,
+        loss: str = 'cross_entropy',
     ):
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
@@ -70,16 +99,19 @@ class HyperGRANDTrainer:
         )
         
         if task_type in ['classification', 'partitioning']:
-            self.criterion = nn.CrossEntropyLoss()
+            if loss == 'focal':
+                self.criterion = FocalLoss(gamma=2.0)
+            else:
+                self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         elif task_type == 'clustering':
-            # For clustering, use cross-entropy on pseudo-labels or just embeddings
-            self.criterion = nn.CrossEntropyLoss()
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         else:
             raise ValueError(f"Unknown task type: {task_type}")
         
         self.train_losses = []
         self.val_losses = []
         self.val_metrics = []
+        self._last_energy_values = {}
     
     def _move_to_device(self, data: Data):
         """Move data to device"""
@@ -120,6 +152,35 @@ class HyperGRANDTrainer:
         )
         self.optimizer.step()
         
+        # Log Dirichlet energy per layer (if any layer has track_energy=True)
+        energy_values = {}
+        if hasattr(self.model, 'diffusion_layers'):
+            energies = []
+            for i, layer in enumerate(self.model.diffusion_layers):
+                e = getattr(layer, 'last_dirichlet_energy', None)
+                if e is not None:
+                    energy_values[f'energy_layer_{i}'] = e
+                    energies.append(e)
+            # Compute normalised ratio (energy_layer_i / energy_layer_0)
+            if energies and energies[0] is not None and energies[0] > 0:
+                e0 = energies[0]
+                for i, e in enumerate(energies):
+                    energy_values[f'energy_ratio_{i}'] = e / e0
+                # First layer where ratio < 0.01 (energy collapse)
+                collapse_layer = next(
+                    (i for i, e in enumerate(energies) if e / e0 < 0.01),
+                    -1
+                )
+                energy_values['energy_collapse_layer'] = collapse_layer
+            # Log to MLflow if available
+            try:
+                import mlflow
+                if mlflow.active_run() is not None and energy_values:
+                    mlflow.log_metrics(energy_values)
+            except Exception:
+                pass  # mlflow not available or not active; skip silently
+        self._last_energy_values = energy_values
+
         # Compute training metric
         with torch.no_grad():
             if self.task_type in ['classification', 'partitioning']:
@@ -189,7 +250,8 @@ class HyperGRANDTrainer:
             'best_epoch': 0,
             'final_test_loss': 0.0,
             'final_test_metric': 0.0,
-            'task_type': self.task_type
+            'task_type': self.task_type,
+            'dirichlet_energies': [],  # list of energy_values dicts, one per epoch
         }
         
         pbar = tqdm(range(num_epochs), desc="Training", disable=not verbose)
@@ -198,6 +260,7 @@ class HyperGRANDTrainer:
             # Train
             train_loss, train_metric = self.train_epoch(data)
             results['train_losses'].append(train_loss)
+            results['dirichlet_energies'].append(getattr(self, '_last_energy_values', {}))
             
             # Validate
             val_loss, val_metric = self.evaluate(data, data.val_mask)
@@ -245,6 +308,132 @@ class HyperGRANDTrainer:
         results['best_epoch'] = best_epoch + 1
         
         return results
+
+
+class HyperedgeReconstructionPretrainer:
+    """Self-supervised pretraining via hyperedge reconstruction.
+
+    Masks a fraction of hyperedges and trains the encoder to reconstruct
+    which nodes co-occur in masked edges. Forces the model to learn
+    structure-aware representations before seeing any labels.
+
+    Usage:
+        pretrainer = HyperedgeReconstructionPretrainer(model, device)
+        pretrainer.pretrain(data, num_epochs=50)
+        # then fine-tune with HyperGRANDTrainer as usual
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        device: torch.device = None,
+        mask_rate: float = 0.2,
+        num_neg_samples: int = 5,
+        learning_rate: float = 0.001,
+    ):
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = model.to(self.device)
+        self.mask_rate = mask_rate
+        self.num_neg_samples = num_neg_samples
+        self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    def _mask_hyperedges(self, hyperedge_index: torch.Tensor):
+        """Randomly mask a fraction of hyperedge entries."""
+        # hyperedge_index is [2, num_entries] where row 0 = edge id, row 1 = node id
+        num_edges = int(hyperedge_index[0].max().item()) + 1
+        num_mask = max(1, int(self.mask_rate * num_edges))
+        masked_edge_ids = torch.randperm(num_edges, device=hyperedge_index.device)[:num_mask]
+
+        # Build a boolean mask over entries
+        mask = torch.zeros(hyperedge_index.size(1), dtype=torch.bool, device=hyperedge_index.device)
+        for eid in masked_edge_ids:
+            mask |= (hyperedge_index[0] == eid)
+
+        kept_index = hyperedge_index[:, ~mask]
+        masked_entries = hyperedge_index[:, mask]
+        return kept_index, masked_entries, masked_edge_ids
+
+    def _reconstruction_loss(
+        self,
+        h: torch.Tensor,
+        masked_entries: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """BCE loss: positive pairs are co-members of masked edges; negatives are random."""
+        if masked_entries.size(1) == 0:
+            return torch.tensor(0.0, device=h.device, requires_grad=True)
+
+        # Build positive pairs from masked entries grouped by edge id
+        edge_ids = masked_entries[0]
+        node_ids = masked_entries[1]
+        unique_edges = edge_ids.unique()
+
+        pos_loss = torch.tensor(0.0, device=h.device)
+        neg_loss = torch.tensor(0.0, device=h.device)
+        count = 0
+
+        for eid in unique_edges:
+            members = node_ids[edge_ids == eid]
+            if members.size(0) < 2:
+                continue
+            # All pairs within the edge (positive)
+            for i in range(members.size(0)):
+                for j in range(i + 1, members.size(0)):
+                    score = (h[members[i]] * h[members[j]]).sum()
+                    pos_loss = pos_loss + F.binary_cross_entropy_with_logits(
+                        score.unsqueeze(0), torch.ones(1, device=h.device)
+                    )
+                    count += 1
+
+            # Random negative pairs
+            for _ in range(min(self.num_neg_samples, members.size(0))):
+                neg_node = torch.randint(0, num_nodes, (1,), device=h.device).item()
+                ref_node = members[torch.randint(0, members.size(0), (1,)).item()]
+                score = (h[ref_node] * h[neg_node]).sum()
+                neg_loss = neg_loss + F.binary_cross_entropy_with_logits(
+                    score.unsqueeze(0), torch.zeros(1, device=h.device)
+                )
+                count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=h.device, requires_grad=True)
+        return (pos_loss + neg_loss) / count
+
+    def pretrain(self, data, num_epochs: int = 50, verbose: bool = True):
+        """Run self-supervised pretraining on the given dataset.
+
+        Args:
+            data: PyG Data object with .x and .hyperedge_index
+            num_epochs: Number of pretraining epochs
+            verbose: Print progress
+        """
+        x = data.x.to(self.device)
+        hyperedge_index = data.hyperedge_index.to(self.device)
+        num_nodes = x.size(0)
+
+        if verbose:
+            print(f"[Pretraining] Starting hyperedge reconstruction pretraining for {num_epochs} epochs...")
+
+        for epoch in range(num_epochs):
+            self.model.train()
+            self.optimizer.zero_grad()
+
+            # Mask a fraction of hyperedges
+            kept_index, masked_entries, _ = self._mask_hyperedges(hyperedge_index)
+
+            # Encode with the masked hypergraph
+            h = self.model(x, kept_index)
+
+            # Reconstruction loss
+            loss = self._reconstruction_loss(h, masked_entries, num_nodes)
+            loss.backward()
+            self.optimizer.step()
+
+            if verbose and (epoch + 1) % 10 == 0:
+                print(f"[Pretraining] Epoch {epoch+1}/{num_epochs}  loss={loss.item():.4f}")
+
+        if verbose:
+            print("[Pretraining] Done.")
 
 
 def train_dataset(
@@ -323,11 +512,15 @@ def train_dataset(
         learning_rate = config.get('lr', learning_rate)
         num_epochs = config.get('epochs', num_epochs)
         patience = config.get('patience', patience)
+        label_smoothing = config.get('label_smoothing', 0.1)
+        loss_type = config.get('loss', 'cross_entropy')
     else:
         num_layers = 3
         alpha = 0.1
         dropout = 0.1
         scheme = 'explicit'
+        label_smoothing = 0.1
+        loss_type = 'cross_entropy'
     
     # Create model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -367,13 +560,26 @@ def train_dataset(
             tags={'task_type': task_type, 'dataset': dataset_name}
         )
     
+    # Self-supervised pretraining (optional, controlled by config['pretrain'])
+    if config and config.get('pretrain', False):
+        pretrain_epochs = config.get('pretrain_epochs', 50)
+        pretrainer = HyperedgeReconstructionPretrainer(
+            model=model,
+            device=device,
+            mask_rate=config.get('pretrain_mask_rate', 0.2),
+            num_neg_samples=config.get('pretrain_neg_samples', 5),
+        )
+        pretrainer.pretrain(data, num_epochs=pretrain_epochs, verbose=verbose)
+
     # Train
     trainer = HyperGRANDTrainer(
         model=model,
         head=head,
         task_type=task_type,
         device=device,
-        learning_rate=learning_rate
+        learning_rate=learning_rate,
+        label_smoothing=label_smoothing,
+        loss=loss_type,
     )
     results = trainer.train(
         data,
@@ -381,6 +587,14 @@ def train_dataset(
         patience=patience,
         verbose=verbose
     )
+    
+    # Summarise Dirichlet energy tracking if available
+    if verbose and results.get('dirichlet_energies'):
+        last_energies = results['dirichlet_energies'][-1]
+        if last_energies:
+            print(f"\n  Dirichlet Energy (final epoch):")
+            for k, v in sorted(last_energies.items()):
+                print(f"    {k}: {v:.4f}" if isinstance(v, float) else f"    {k}: {v}")
     
     # Log results to MLflow if logger provided
     if mlflow_logger:

@@ -11,10 +11,54 @@ from training.trainer import create_hypergraph_trainer, BaseHypergraphTrainer
 
 
 class EdgeDropout:
-    """Edge dropout utility for hypergraphs"""
+    """Edge dropout utility for hypergraphs.
 
-    def __init__(self, dropout_rate: float = 0.5):
+    Supports three modes:
+    - 'uniform': drop each hyperedge-entry with uniform probability (original behaviour)
+    - 'size': larger hyperedges are dropped with higher probability, controlled by
+              a learnable/fixed weight `size_weight`. Drop prob for edge e is
+              sigmoid(size_weight * log(|e|)) capped at max_drop_prob.
+    - 'schedule': linearly anneal dropout_rate from initial_rate to 0 over
+                  total_epochs epochs. Call .step_epoch() each epoch.
+
+    Args:
+        dropout_rate: Base dropout rate (probability of dropping each edge).
+        mode: One of 'uniform', 'size', 'schedule'.
+        size_weight: Scalar controlling size-based dropout sensitivity (mode='size').
+        max_drop_prob: Maximum per-edge drop probability for size-based mode.
+        total_epochs: Total training epochs, used for schedule mode.
+    """
+
+    def __init__(
+        self,
+        dropout_rate: float = 0.5,
+        mode: str = 'uniform',
+        size_weight: float = 1.0,
+        max_drop_prob: float = 0.9,
+        total_epochs: int = 200,
+    ):
+        self.initial_rate = dropout_rate
         self.dropout_rate = dropout_rate
+        self.mode = mode
+        self.size_weight = size_weight
+        self.max_drop_prob = max_drop_prob
+        self.total_epochs = total_epochs
+        self._current_epoch = 0
+
+    def step_epoch(self):
+        """Anneal dropout rate for schedule mode. Call once per training epoch."""
+        if self.mode == 'schedule':
+            self._current_epoch += 1
+            progress = min(1.0, self._current_epoch / max(1, self.total_epochs))
+            self.dropout_rate = self.initial_rate * (1.0 - progress)
+
+    def _compute_edge_sizes(self, hyperedge_index: torch.Tensor) -> torch.Tensor:
+        """Return a tensor of edge sizes indexed by edge id."""
+        num_edges = int(hyperedge_index[0].max().item()) + 1
+        sizes = torch.zeros(num_edges, device=hyperedge_index.device)
+        ones = torch.ones(hyperedge_index.size(1), device=hyperedge_index.device)
+        sizes.scatter_add_(0, hyperedge_index[0], ones)
+        return sizes
 
     def __call__(
         self,
@@ -22,12 +66,11 @@ class EdgeDropout:
         hyperedge_weight: Optional[torch.Tensor] = None,
         training: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Apply edge dropout to hypergraph structure
+        """Apply edge dropout to hypergraph structure.
 
         Args:
-            hyperedge_index: [2, num_edges] hyperedge connectivity
-            hyperedge_weight: Optional edge weights
+            hyperedge_index: [2, num_entries] hyperedge connectivity
+            hyperedge_weight: Optional per-entry weights
             training: Whether model is in training mode
 
         Returns:
@@ -36,24 +79,35 @@ class EdgeDropout:
         if not training or self.dropout_rate == 0.0:
             return hyperedge_index, hyperedge_weight
 
-        num_edges = hyperedge_index.size(1)
-        if num_edges == 0:
+        num_entries = hyperedge_index.size(1)
+        if num_entries == 0:
             return hyperedge_index, hyperedge_weight
 
-        # Create dropout mask
-        keep_prob = 1.0 - self.dropout_rate
-        edge_mask = torch.rand(num_edges, device=hyperedge_index.device) < keep_prob
+        if self.mode == 'size':
+            # Compute per-edge drop probabilities based on edge size
+            edge_sizes = self._compute_edge_sizes(hyperedge_index)  # [num_edges]
+            import math as _math
+            log_sizes = torch.log(edge_sizes.clamp(min=1).float())
+            drop_probs = torch.sigmoid(
+                torch.tensor(self.size_weight, device=hyperedge_index.device) * log_sizes
+            ).clamp(max=self.max_drop_prob)  # [num_edges]
 
-        # Apply mask to hyperedge_index
+            # Per-entry drop decision based on the edge's drop probability
+            entry_edge_ids = hyperedge_index[0]  # [num_entries]
+            entry_drop_probs = drop_probs[entry_edge_ids]  # [num_entries]
+            edge_mask = torch.rand(num_entries, device=hyperedge_index.device) >= entry_drop_probs
+        else:
+            # Uniform or schedule mode: same rate for all entries
+            keep_prob = 1.0 - self.dropout_rate
+            edge_mask = torch.rand(num_entries, device=hyperedge_index.device) < keep_prob
+
         dropped_hyperedge_index = hyperedge_index[:, edge_mask]
-
-        # Apply mask to hyperedge_weight if it exists
         dropped_hyperedge_weight = None
         if hyperedge_weight is not None:
             dropped_hyperedge_weight = hyperedge_weight[edge_mask]
-            # Rescale weights to maintain expected sum
+            keep_prob_eff = edge_mask.float().mean().clamp(min=1e-8)
             if dropped_hyperedge_weight.numel() > 0:
-                dropped_hyperedge_weight = dropped_hyperedge_weight / keep_prob
+                dropped_hyperedge_weight = dropped_hyperedge_weight / keep_prob_eff
 
         return dropped_hyperedge_index, dropped_hyperedge_weight
 
