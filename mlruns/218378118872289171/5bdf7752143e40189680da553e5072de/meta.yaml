@@ -1,0 +1,14 @@
+artifact_uri: /Users/atishayamaharjan/Research/TerraByte/ai/codebase/HyperGRAND/mlruns/218378118872289171/5bdf7752143e40189680da553e5072de/artifacts
+end_time: 1779862605937
+entry_point_name: ''
+experiment_id: '218378118872289171'
+lifecycle_stage: active
+run_id: 5bdf7752143e40189680da553e5072de
+run_name: contact_high_school_A_supervised_ce_seed42
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779862605236
+status: 3
+tags: []
+user_id: atishayamaharjan

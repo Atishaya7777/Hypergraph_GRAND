@@ -1,0 +1,15 @@
+artifact_uri: /Users/atishayamaharjan/Research/TerraByte/ai/codebase/HyperGRAND/mlruns/218378118872289171/3d7d8285a84f48538e4c498bdfba06eb/artifacts
+deleted_time: 1779860473819
+end_time: null
+entry_point_name: ''
+experiment_id: '218378118872289171'
+lifecycle_stage: deleted
+run_id: 3d7d8285a84f48538e4c498bdfba06eb
+run_name: mode_supervised_crossentropy
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779859936832
+status: 1
+tags: []
+user_id: atishayamaharjan

@@ -1,0 +1,15 @@
+artifact_uri: /Users/atishayamaharjan/Research/TerraByte/ai/codebase/HyperGRAND/mlruns/218378118872289171/3d0cce4090db426c8ff51e81a1a35092/artifacts
+deleted_time: 1779860243020
+end_time: 1779859801927
+entry_point_name: ''
+experiment_id: '218378118872289171'
+lifecycle_stage: deleted
+run_id: 3d0cce4090db426c8ff51e81a1a35092
+run_name: mode_unsupervised_baseline
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1779859801771
+status: 4
+tags: []
+user_id: atishayamaharjan

@@ -1,0 +1,20 @@
+{
+  "mode": "train",
+  "dataset": null,
+  "hidden-dim": 32,
+  "num-layers": 3,
+  "alpha": 0.1,
+  "dropout": 0.1,
+  "scheme": "explicit",
+  "epochs": 200,
+  "patience": 50,
+  "lr": 0.01,
+  "weight-decay": 0.00001,
+  "mlflow-experiment": "HyperGRAND",
+  "mlflow-tracking-uri": "http://localhost:5000",
+  "no-mlflow": false,
+  "output": "hypergrand_results.json",
+  "save-results": null,
+  "verbose": true,
+  "seed": 42
+}

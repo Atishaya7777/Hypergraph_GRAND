@@ -1,0 +1,25 @@
+# HyperGRAND Diffusion Study Configuration
+# Fast mode configuration for quick hypothesis testing
+
+# Model architecture
+hidden_dim: 32
+num_layers: 2
+alpha: 0.1
+dropout: 0.1
+
+# Integration scheme: explicit, implicit, adaptive
+integration_scheme: explicit
+
+# Attention mechanism
+use_attention: true
+attention_type: full
+
+# Training parameters (reduced for fast testing)
+epochs: 100
+patience: 20
+lr: 0.01
+weight_decay: 0.00001
+
+# Study metadata
+study_dimension: baseline
+config_variant: fast_mode
