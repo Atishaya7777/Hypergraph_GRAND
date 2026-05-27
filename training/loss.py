@@ -56,8 +56,10 @@ def clustering_loss_function(
     inter_cluster_loss = torch.tensor(0.0, device=device)
     if len(centroids) > 1:
         centroids = torch.stack(centroids)
-        # Compute all pairwise distances between centroids
-        centroid_distances = torch.cdist(centroids, centroids, p=2)
+        # Pairwise L2 without torch.cdist (MPS lacks cdist backward)
+        sq = (centroids ** 2).sum(dim=1, keepdim=True)
+        dist_sq = sq + sq.T - 2.0 * (centroids @ centroids.T)
+        centroid_distances = torch.sqrt(dist_sq.clamp(min=1e-8))
         # Extract upper triangular part (avoid double counting)
         mask = torch.triu(torch.ones_like(
             centroid_distances, dtype=torch.bool), diagonal=1)

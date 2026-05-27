@@ -64,9 +64,9 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["test", "train", "validate", "batch", "diffusion-study"],
+        choices=["test", "train", "validate", "batch"],
         default="train",
-        help="Mode: test (structure validation), train (training), validate (full validation), batch (train all datasets), diffusion-study (run parameter studies)",
+        help="Mode: test, train, validate, or batch (train all datasets)",
     )
 
     # Dataset selection
@@ -157,38 +157,6 @@ def parse_args():
     # Reproducibility
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
-    )
-
-    # Diffusion study parameters
-    parser.add_argument(
-        "--study-dimension",
-        type=str,
-        nargs="+",
-        choices=["integration_scheme", "diffusion_depth", "attention_mechanism", "all"],
-        default=["all"],
-        help="Study dimensions to explore (for diffusion-study mode)",
-    )
-    parser.add_argument(
-        "--num-seeds",
-        type=int,
-        default=5,
-        help="Number of random seeds per configuration (for diffusion-study mode)",
-    )
-    parser.add_argument(
-        "--representative-only",
-        action="store_true",
-        help="Use only representative datasets (for diffusion-study mode)",
-    )
-    parser.add_argument(
-        "--parallel-workers",
-        type=int,
-        default=None,
-        help="Number of parallel workers (default: auto-detect, for diffusion-study mode)",
-    )
-    parser.add_argument(
-        "--fast-mode",
-        action="store_true",
-        help="Use reduced configuration set for fast validation (for diffusion-study mode)",
     )
 
     # Parse arguments
@@ -732,51 +700,6 @@ def run_batch_mode(args):
     return results
 
 
-def run_diffusion_study_mode(args):
-    """Run systematic diffusion parameter studies with MLflow tracking"""
-    print(f"\n{'='*100}")
-    print("DIFFUSION PARAMETER STUDIES")
-    print(f"{'='*100}\n")
-    
-    from experiments.run_diffusion_studies import DiffusionStudyRunner
-    
-    # Create MLflow logger
-    mlflow_logger = MLFlowLogger(
-        enabled=not args.no_mlflow,
-        experiment_name="HyperGRAND_Diffusion_Studies",
-        tracking_uri=args.mlflow_tracking_uri if hasattr(args, 'mlflow_tracking_uri') else None
-    )
-    
-    # Handle "all" dimension
-    if 'all' in args.study_dimension:
-        study_dimensions = ['integration_scheme', 'diffusion_depth', 'attention_mechanism']
-    else:
-        study_dimensions = args.study_dimension
-    
-    # Create runner
-    runner = DiffusionStudyRunner(
-        study_dimensions=study_dimensions,
-        datasets=args.datasets,
-        num_seeds=args.num_seeds,
-        parallel_workers=args.parallel_workers,
-        fast_mode=args.fast_mode,
-        representative_only=args.representative_only,
-        mlflow_logger=mlflow_logger if not args.no_mlflow else None
-    )
-    
-    # Run studies
-    results = runner.run()
-    
-    # Save results
-    if args.output:
-        import json
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"\nResults saved to {args.output}")
-    
-    return results
-
-
 def main():
     """Unified main entry point for all testing and training modes."""
     args = parse_args()
@@ -857,22 +780,6 @@ def main():
                         nmi = result.get('test_nmi', 0.0)
                         ari = result.get('test_ari', 0.0)
                         print(f"{dataset_name} ({task_type}): Best Epoch={best_epoch}, Test NMI={nmi:.4f}, Test ARI={ari:.4f}, Test Loss={test_loss:.4f}")
-            print(f"{'='*100}\n")
-        
-        elif args.mode == 'diffusion-study':
-            # Run diffusion parameter studies
-            results = run_diffusion_study_mode(args)
-            
-            # Print summary
-            print(f"\n{'='*100}")
-            print("DIFFUSION STUDY SUMMARY")
-            print(f"{'='*100}")
-            for study_dim, dim_results in results.items():
-                successful = sum(1 for r in dim_results if r['success'])
-                failed = sum(1 for r in dim_results if not r['success'])
-                print(f"\n{study_dim}:")
-                print(f"  Successful: {successful}/{len(dim_results)}")
-                print(f"  Failed: {failed}/{len(dim_results)}")
             print(f"{'='*100}\n")
         
         else:

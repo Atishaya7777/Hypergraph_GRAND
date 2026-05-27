@@ -74,15 +74,20 @@ class UniversalDataConverter:
             # Create dummy hyperedge index if missing
             data.hyperedge_index = torch.zeros((2, 0), dtype=torch.long)
         elif hasattr(data.hyperedge_index, 'toarray'):
-            # Convert sparse hyperedge_index to dense COO format
+            # Incidence matrix is typically [num_nodes, num_hyperedges]:
+            # coo.row = node, coo.col = hyperedge → stack as [hyperedge_id, node_id]
             sparse_he = data.hyperedge_index
             coo = sparse_he.tocoo()
             data.hyperedge_index = torch.stack([
+                torch.from_numpy(coo.col),
                 torch.from_numpy(coo.row),
-                torch.from_numpy(coo.col)
             ], dim=0).long()
         elif not isinstance(data.hyperedge_index, torch.Tensor):
             data.hyperedge_index = torch.tensor(data.hyperedge_index, dtype=torch.long)
+
+        data.hyperedge_index = self._canonicalize_hyperedge_index(
+            data.hyperedge_index, data.num_nodes,
+        )
         
         # Create splits if needed
         if not hasattr(data, 'train_mask') or data.train_mask is None:
@@ -99,7 +104,13 @@ class UniversalDataConverter:
             task_type=task_type,
             num_nodes=data.num_nodes,
             num_classes=num_classes,
-            num_hyperedges=data.hyperedge_index.shape[1] if hasattr(data, 'hyperedge_index') and data.hyperedge_index is not None else 0,
+            num_hyperedges=(
+                int(data.hyperedge_index[0].unique().numel())
+                if hasattr(data, 'hyperedge_index')
+                and data.hyperedge_index is not None
+                and data.hyperedge_index.numel() > 0
+                else 0
+            ),
             source="",
             node_feature_dim=data.x.shape[1] if data.x is not None else None
         )
@@ -490,11 +501,11 @@ class UniversalDataConverter:
                     edge_dict[hyperedge_id] = []
                 edge_dict[hyperedge_id].append(node_idx)
         
-        # Convert to [hyperedge_id, node_id] tensor
+        # Convert to [hyperedge_id, node_id] with contiguous edge ids 0..E-1
         hyperedge_list = []
-        for he_id in sorted(edge_dict.keys()):
+        for compact_id, he_id in enumerate(sorted(edge_dict.keys())):
             for node_idx in edge_dict[he_id]:
-                hyperedge_list.append([he_id, node_idx])
+                hyperedge_list.append([compact_id, node_idx])
         
         if hyperedge_list:
             return torch.tensor(hyperedge_list, dtype=torch.long).t().contiguous()
@@ -531,6 +542,43 @@ class UniversalDataConverter:
         )
     
     # ===== Helpers =====
+
+    def _canonicalize_hyperedge_index(
+        self,
+        hyperedge_index: torch.Tensor,
+        num_nodes: int,
+    ) -> torch.Tensor:
+        """
+        Ensure [hyperedge_id, node_id] layout and contiguous hyperedge ids 0..E-1.
+        """
+        if hyperedge_index is None or hyperedge_index.numel() == 0:
+            return hyperedge_index
+
+        he = hyperedge_index.long()
+        r0, r1 = he[0], he[1]
+
+        # Heuristic: if row0 looks like node indices and row1 like edge ids, swap
+        n0 = int(r0.unique().numel())
+        n1 = int(r1.unique().numel())
+        r0_node_like = int(r0.max().item()) < num_nodes and n0 <= num_nodes
+        r1_node_like = int(r1.max().item()) < num_nodes and n1 <= num_nodes
+        if r0_node_like and not r1_node_like:
+            he = torch.stack([r1, r0], dim=0)
+        elif not r0_node_like and r1_node_like:
+            pass  # already [edge, node]
+        elif r0_node_like and r1_node_like:
+            # Both look like node ids (ambiguous); prefer smaller unique count as edges
+            if n0 > n1:
+                he = torch.stack([r1, r0], dim=0)
+
+        e_ids = he[0]
+        unique_e = torch.unique(e_ids, sorted=True)
+        if unique_e.numel() < int(unique_e.max().item()) + 1:
+            remap = torch.zeros(int(unique_e.max().item()) + 1, dtype=torch.long)
+            remap[unique_e] = torch.arange(unique_e.numel(), dtype=torch.long)
+            he = torch.stack([remap[he[0]], he[1]], dim=0)
+
+        return he.contiguous()
     
     def _create_hyperedge_index(self, hyperedges: list, num_nodes: int) -> torch.Tensor:
         """Convert hyperedges to COO format"""

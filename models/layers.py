@@ -61,6 +61,37 @@ def _segment_softmax(scores: torch.Tensor, segment_ids: torch.Tensor,
     return exp_scores / seg_sum[segment_ids]
 
 
+def _compact_hyperedge_ids(
+    e_idx: torch.Tensor,
+    hyperedge_weight: Optional[torch.Tensor],
+    device: torch.device,
+) -> tuple:
+    """
+    Remap arbitrary hyperedge ids (e.g. word ids 16242..16341) to contiguous 0..E-1.
+
+    Using max(e_idx)+1 for E breaks when ids are sparse (news_20w100: 100 edges,
+    max id 16341).
+    """
+    if e_idx.numel() == 0:
+        return e_idx, 0, None, hyperedge_weight
+
+    unique_e, e_compact = torch.unique(e_idx, sorted=True, return_inverse=True)
+    E = int(unique_e.numel())
+
+    if hyperedge_weight is None:
+        return e_compact, E, unique_e, None
+
+    w = hyperedge_weight.to(device)
+    if w.numel() == E:
+        edge_w = w
+    elif w.numel() >= int(unique_e.max().item()) + 1:
+        edge_w = w[unique_e]
+    else:
+        edge_w = torch.ones(E, device=device, dtype=w.dtype)
+
+    return e_compact, E, unique_e, edge_w
+
+
 # ---------------------------------------------------------------------------
 # HypergraphDiffusionLayer
 # ---------------------------------------------------------------------------
@@ -88,6 +119,7 @@ class HypergraphDiffusionLayer(nn.Module):
         dropout      : dropout rate applied after layer norm
         num_heads    : attention heads for G_theta computation
         learnable_mu : if True, compute mu via bilinear form W_mu (default True)
+        track_energy   : if True, store differentiable joint Dirichlet energy per forward
     """
 
     def __init__(
@@ -97,11 +129,17 @@ class HypergraphDiffusionLayer(nn.Module):
         dropout: float = 0.1,
         num_heads: int = 1,
         learnable_mu: bool = True,
+        track_energy: bool = False,
     ):
         super().__init__()
         self.hidden_dim  = hidden_dim
         self.num_heads   = num_heads
         self.learnable_mu = learnable_mu
+        self.track_energy = track_energy
+        self.last_dirichlet_energy: Optional[torch.Tensor] = None
+        self.last_mu: Optional[torch.Tensor] = None
+        self.last_e_idx: Optional[torch.Tensor] = None
+        self.last_edge_counts: Optional[torch.Tensor] = None
 
         # Learnable per-layer step size: always positive via exp
         self.log_alpha = nn.Parameter(torch.tensor(math.log(alpha)))
@@ -140,15 +178,15 @@ class HypergraphDiffusionLayer(nn.Module):
             psi_new         : [N, d]
         """
         N, d  = psi.shape
-        e_idx = hyperedge_index[0]   # [M]  edge id per entry
-        v_idx = hyperedge_index[1]   # [M]  node id per entry
-        M     = e_idx.shape[0]
-        E     = int(e_idx.max().item()) + 1
+        e_idx_raw = hyperedge_index[0]   # [M]  edge id per entry
+        v_idx     = hyperedge_index[1]   # [M]  node id per entry
+        M         = e_idx_raw.shape[0]
 
-        if hyperedge_weight is None:
+        e_idx, E, _unique_e, edge_w = _compact_hyperedge_ids(
+            e_idx_raw, hyperedge_weight, psi.device,
+        )
+        if edge_w is None:
             edge_w = psi.new_ones(E)
-        else:
-            edge_w = hyperedge_weight.to(psi.device)
 
         # --- 1. Compute mu(e,v) -------------------------------------------
         mu = self._compute_mu(psi, e_idx, v_idx, E)   # [M]
@@ -162,6 +200,21 @@ class HypergraphDiffusionLayer(nn.Module):
         # --- 3. Compute hyperedge gradient grad_e -------------------------
         grad = self._compute_gradient(psi, e_idx, v_idx, mu, deg, edge_w, E, M)
         # grad: [E, d]
+
+        if self.track_energy:
+            counts = psi.new_zeros(E)
+            counts.scatter_add_(0, e_idx, psi.new_ones(M))
+            self.last_dirichlet_energy = self._joint_dirichlet_energy(
+                grad, edge_w, counts,
+            )
+            self.last_mu = mu
+            self.last_e_idx = e_idx
+            self.last_edge_counts = counts
+        else:
+            self.last_dirichlet_energy = None
+            self.last_mu = None
+            self.last_e_idx = None
+            self.last_edge_counts = None
 
         # --- 4. Compute diffusion tensor G_theta --------------------------
         G = self._compute_diffusion_tensor(psi, e_idx, v_idx, E)
@@ -177,6 +230,39 @@ class HypergraphDiffusionLayer(nn.Module):
         psi_new  = self.layer_norm(psi_new)
         psi_new  = F.dropout(psi_new, p=self.dropout_p, training=self.training)
         return psi_new
+
+    @staticmethod
+    def _joint_dirichlet_energy(
+        grad: torch.Tensor,
+        edge_w: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Scalar joint Dirichlet energy (specs/joint-energy.md), using per-edge
+        gradient norm and |e|-1 normalisation:
+
+            E = sum_e w(e) * ||grad_e psi||^2 / (|e| - 1)
+        """
+        m_minus_1 = (counts - 1.0).clamp(min=1.0)
+        per_edge = edge_w * grad.pow(2).sum(dim=-1) / m_minus_1
+        return per_edge.sum()
+
+    @staticmethod
+    def mu_entropy_from_last(mu: torch.Tensor, e_idx: torch.Tensor, E: int) -> float:
+        """Mean per-edge entropy of mu (nats); uniform mu has entropy log(|e|)."""
+        if mu is None or e_idx is None or mu.numel() == 0:
+            return float("nan")
+        counts = mu.new_zeros(E)
+        counts.scatter_add_(0, e_idx, mu.new_ones(e_idx.shape[0]))
+        counts = counts.clamp(min=1.0)
+        seg_sum = mu.new_zeros(E)
+        seg_sum.scatter_add_(0, e_idx, mu)
+        p = (mu / seg_sum[e_idx].clamp(min=1e-8)).clamp(min=1e-8)
+        ent_per_entry = -(p * p.log())
+        ent_sum = mu.new_zeros(E)
+        ent_sum.scatter_add_(0, e_idx, ent_per_entry)
+        mean_ent = (ent_sum / counts).mean()
+        return float(mean_ent.item())
 
     # ------------------------------------------------------------------
     # Core vectorized operations
@@ -272,22 +358,20 @@ class HypergraphDiffusionLayer(nn.Module):
             scaled_feats,
         )                                                  # [E, d]
 
-        # Reference-node correction:
-        # For each edge e, subtract the contribution of the reference node |e| times.
-        # We use the first occurrence of each edge in the COO as the reference node.
-        # Build a mask: is this entry the FIRST occurrence of its edge id?
-        # Equivalent: entry i is reference iff e_idx[i] != e_idx[i-1] (or i==0)
-        is_ref = psi.new_zeros(M, dtype=torch.bool)
-        is_ref[0] = True
-        if M > 1:
-            is_ref[1:] = e_idx[1:] != e_idx[:-1]
-
         # Count members per edge
         counts = psi.new_zeros(E)
         counts.scatter_add_(0, e_idx, psi.new_ones(M))    # [E]
 
-        # Subtract ref_scaled * counts[e]  from grad_sum
-        ref_scaled_feats = scaled_feats[is_ref]            # [E, d]  (one per edge)
+        # Reference-node correction: one reference incidence per edge (not per COO run)
+        first_inc_f = torch.full((E,), float(M), device=psi.device)
+        first_inc_f.scatter_reduce_(
+            0,
+            e_idx,
+            torch.arange(M, device=psi.device, dtype=torch.float32),
+            reduce="amin",
+            include_self=False,
+        )
+        ref_scaled_feats = scaled_feats[first_inc_f.long()]  # [E, d]
         correction = ref_scaled_feats * counts.unsqueeze(-1)  # [E, d]
         grad = grad_sum - correction                        # [E, d]
 
